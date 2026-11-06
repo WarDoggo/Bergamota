@@ -2,7 +2,7 @@
 
 This tree is GiaSen's `dipper` branch (Mi 8, same Snapdragon 845) plus the changes for the Poco F1. Bytesfence has already booted iOS 26 with the GPU on a real Poco F1, but the Wi-Fi, Bluetooth, sound, vibration and flashlight work is on the Mi 8. Those are the parts this tree moves over.
 
-**State of this tree:** the patches apply cleanly to the Mi 8 series (108 source files rebuilt, 0 failed hunks, 4 files changed). Nothing has been compiled yet and nothing has run on a phone.
+**State of this tree:** the kernel and the GPU library both built on GitHub Actions on 2026-11-06, with all three Poco F1 patches applied. Nothing has run on a phone yet.
 
 ## What was changed
 
