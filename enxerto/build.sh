@@ -41,7 +41,7 @@ esac
 # keymaster upgrade its keys, and Android would then fail to decrypt its data on the next normal boot)
 case $BOARD in
 dipper)	OS_VERSION=10.0.0; OS_PATCH=2020-09 ;;	# backup/dipper/boot.img (Android 10)
-*)	OS_VERSION=16.0.0; OS_PATCH=2025-06 ;;
+*)	OS_VERSION=${OS_VERSION:-16.0.0}; OS_PATCH=${OS_PATCH:-2025-06} ;;	# set them to your ROM's: see the note above
 esac
 HOSTDEF=
 case $BOARD in

@@ -26,7 +26,7 @@ This tree is GiaSen's `dipper` branch (Mi 8, same Snapdragon 845) plus the chang
 | Wi-Fi rail L23 | Refused, so left out | Voted | Gate stays correct |
 | Bluetooth | gpio45-48 | Same pins and rails | Should carry over; running next to Wi-Fi is untested here |
 | Amps | One TAS2557 | TAS2559 at 0x4c + TAS2560 at 0x4d, same I2C bus | Reset pins patched; amp scripts still to write |
-| Earpiece | Codec EAR output | Probably on the TAS2560 | Unknown until tested |
+| Earpiece | Codec EAR output | Through the amps, not the codec: same QUAT MI2S line, one channel, amp firmware configuration 13 | The phone's own audio files confirm it. Speaker is configuration 14, two channels |
 | Headphone jack | None | WCD9340 jack detection | New work |
 | Motor limit | 3100 mV | 2812 mV | Patched |
 | Flashlight | PMI8998 | PMI8998, both LEDs rear | Patched |
@@ -106,6 +106,6 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 ## Still to do with the phone
 
 - `tools/audio/tas2559fw.py`: the same job as `tas2557fw.py` for firmware device 4. The TAS2560 has a different register map.
-- Find out how the two amps map to the bottom speaker and the earpiece.
+- Test the amp firmware configurations: 14 speaker, 12 one speaker, 13 earpiece, with the boost at 5.6 V (always on for the earpiece).
 - Headphone jack detection.
 - More memory: about 3.95 GB is in use now, and the low bank could add about 1.2 GB.

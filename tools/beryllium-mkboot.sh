@@ -32,5 +32,8 @@ CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled
 [ -n "$ROOTPART" ] && CMDLINE="$CMDLINE ufsroot=$ROOTPART"
 CMDLINE="$CMDLINE${EXTRA_ARGS:+ $EXTRA_ARGS}"
 [ "${#CMDLINE}" -le 607 ] || { echo "boot-args are ${#CMDLINE} bytes, the field holds 607" >&2; exit 1; }
+# The image's version stamp must not be newer than the ROM on the phone, or keymaster can upgrade its keys and Android
+# can no longer read its data. These are the crDroid 9.12 ROM's values, from its boot.img header. Check yours before a test boot.
+export OS_VERSION=${OS_VERSION:-13.0.0} OS_PATCH=${OS_PATCH:-2023-12}
 RENEGADE_TARGET=ios26 BOARD=beryllium DTB="$PWD/dtb/beryllium/dtb" CMDLINE="$CMDLINE" \
 	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/beryllium-n104-2x-wlan-gpu-hap.adt}" "$2"
