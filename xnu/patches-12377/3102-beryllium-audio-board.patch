@@ -1,0 +1,107 @@
+From: Poco F1 iOS port
+Subject: [PATCH] Poco F1: audio DSP, codec clock and the second amp's reset pin
+
+The audio stack of 3040-3067j runs on the Poco F1's hardware with these differences, from LineageOS beryllium-p0.dtsi and
+mainline sdm845-xiaomi-beryllium-common.dtsi:
+
+ - Same: QUAT MI2S on SD0, the amp bus (qupv3_se5_i2c, gpio85/86), WCD9340 on SLIMbus with reset TLMM 64, the audio DSP.
+ - Different: two amps on that bus. TAS2559 at 0x4c, reset gpio12 (SOUTH tile, 0x03d00000 = TLMM 0x03400000 + 0x900000; pinctrl-sdm845.c
+   and pinctrl-sdm845-v2.c agree) and TAS2560 at 0x4d, reset gpio76. On the Mi 8 gpio76 is the only amp's reset, so running the Mi 8
+   sequence here unchanged would hold the wrong chip in reset. Script op 03 now moves both pins, which is what TI's
+   tas2559_hw_reset() ends up doing, and the Mi 8 behaves as before.
+
+The kernel's amp status read (registers 104 and 108 at 0x4c) is right for the TAS2559: same FLAGS_1/2 registers as the TAS2557.
+Still to come, and they need the phone: tools/audio/tas2559fw.py (TAS2560 has a different register map and the firmware is
+device 4), and the earpiece, which is most likely on the TAS2560 here and not on the WCD9340 EAR output as on the Mi 8. Not tested
+on a Poco F1 yet; sweetaudio stays off unless the boot-arg asks for it.
+
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -452,13 +452,13 @@
+ /*
+  * Mi 8 (dipper) WCD9340 MCLK, 3058: live DT audio_ext_clk_lnbb (qcom,audio-ref-clk) clocks = <&clock_rpmh 2> =
+  * RPMH_LN_BB_CLK2; clk-rpmh.c DEFINE_CLK_RPMH_VRM(sdm845, ln_bb_clk2, ..., "lnbclka2") votes 1 at the cmd-db address
+- * + CLK_RPMH_VRM_EN_OFFSET (4), like rfclka2 above. Active-set vote only, never voted off. Dipper only.
++ * + CLK_RPMH_VRM_EN_OFFSET (4), like rfclka2 above. Active-set vote only, never voted off. Mi 8 and Poco F1.
+  */
+ int sweet_rpmh_lnbclk2_enable(void);
+ int
+ sweet_rpmh_lnbclk2_enable(void)
+ {
+-	if (!sweet_board_is("xiaomi,dipper")) {
++	if (!sweet_board_beryllium()) {
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -1852,9 +1852,15 @@
+ #define AU_I2C_SDA              85u
+ #define AU_I2C_SCL              86u
+ #define AU_TAS_RESET            76u
++#define AU_TLMM_SOUTH_PA        0x03d00000u     /* TLMM + SOUTH: gpio12 */
++/*
++ * Poco F1 (beryllium-p0.dtsi, tas2559@4c on this same bus): two amps, TAS2559 at 0x4c with reset gpio12 and TAS2560 at 0x4d
++ * with reset gpio76. gpio76 is the only amp's reset on the Mi 8, the second amp's here. Op 03 moves both pins.
++ */
++#define AU_TAS2559_RESET        12u
+ #define AU_I2C_HALF_US          5u
+ static struct {
+-	vm_offset_t sda, scl, rst;
++	vm_offset_t sda, scl, rst, rst2;
+ } ai;
+ 
+ static void
+@@ -1899,8 +1905,15 @@
+ 	}
+ 	vm_offset_t s = ml_io_map(AU_TLMM_EAST_PA + AU_I2C_SDA * 0x1000u, 2 * 0x1000u);
+ 	vm_offset_t r = ml_io_map(AU_TLMM_EAST_PA + AU_TAS_RESET * 0x1000u, 0x1000u);
++	vm_offset_t r2 = 0;
+ 	if (!s || !r) {
+ 		return false;
++	}
++	if (!sweet_board_is("xiaomi,dipper")) {
++		if (!(r2 = ml_io_map(AU_TLMM_SOUTH_PA + AU_TAS2559_RESET * 0x1000u, 0x1000u))) {
++			return false;
++		}
++		printf("SWEET AUDIO: Poco F1 TAS2559 reset gpio12 cfg %#x io %#x\n", ai_rd(r2), ai_rd(r2 + 4));
+ 	}
+ 	printf("SWEET AUDIO: amp bus gpio85/86 cfg %#x %#x io %#x %#x, reset gpio76 cfg %#x io %#x\n", ai_rd(s), ai_rd(s + 0x1000u),
+ 	    ai_rd(s + 4), ai_rd(s + 0x1004u), ai_rd(r), ai_rd(r + 4));
+@@ -1912,6 +1925,7 @@
+ 	ai.sda = s;
+ 	ai.scl = s + 0x1000u;
+ 	ai.rst = r;
++	ai.rst2 = r2;
+ 	delay(10);
+ 	for (unsigned i = 0; i < 9 && !ai_get(ai.sda); i++) {       /* a slave holding SDA: clock it out */
+ 		ai_line(ai.scl, false);
+@@ -2052,8 +2066,13 @@
+ static void
+ ai_reset_pin(bool high)
+ {
+-	ai_wr(ai.rst + 4, (ai_rd(ai.rst + 4) & ~2u) | (high ? 2u : 0u));
+-	ai_wr(ai.rst, (ai_rd(ai.rst) & ~0x3ffu) | 0x200u);         /* GPIO, no pull, 2 mA, output */
++	const vm_offset_t pins[2] = { ai.rst, ai.rst2 };
++	for (unsigned i = 0; i < 2; i++) {
++		if (pins[i]) {
++			ai_wr(pins[i] + 4, (ai_rd(pins[i] + 4) & ~2u) | (high ? 2u : 0u));
++			ai_wr(pins[i], (ai_rd(pins[i]) & ~0x3ffu) | 0x200u);         /* GPIO, no pull, 2 mA, output */
++		}
++	}
+ }
+ 
+ /* one script (ops above), au_mtx held and the bus set up: the error, the ops done in *done, the bytes read at out + *o */
+@@ -4551,8 +4570,8 @@
+ 	if (!stage) {
+ 		return;
+ 	}
+-	if (!sweet_board_is("xiaomi,dipper")) {
+-		printf("SWEET AUDIO: sweetaudio=%u is for the Mi 8 (dipper): ignored\n", stage);
++	if (!sweet_board_beryllium()) {
++		printf("SWEET AUDIO: sweetaudio=%u is for the Mi 8 and the Poco F1: ignored\n", stage);
+ 		return;
+ 	}
+ 	au.stage = stage;

@@ -1,0 +1,19 @@
+From: Poco F1 iOS port
+Subject: [PATCH] Poco F1: the system cache, DDR and L3 tuning of 3009
+
+The Mi 8's patch 3009 only ran on the Mi 8, but nothing in it depends on that phone: LLCC and the L3 and DDR votes are the
+SoC's. Mi 8 notes: the Poco F1 "has the same gate and the same missing LLCC and votes". sweetmemtune=0 still turns it off.
+sweet_board_beryllium() is true on both phones (the Mi 8's ADT also lists xiaomi,beryllium).
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1001,7 +1001,7 @@
+ {
+ 	int on = 1;
+ 	(void)PE_parse_boot_argn("sweetmemtune", &on, sizeof(on));
+-	if (!on || !sweet_board_is("xiaomi,dipper")) {
++	if (!on || !sweet_board_beryllium()) {
+ 		return;
+ 	}
+ 	if (__atomic_exchange_n(&sweet_mem_lock, 1, __ATOMIC_ACQUIRE) == 0) {

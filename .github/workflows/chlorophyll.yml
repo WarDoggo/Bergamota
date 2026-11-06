@@ -1,0 +1,90 @@
+# Chlorophyll (the GPU userland: Turnip + the AIR frontend + the Metal device) for the Poco F1 on iOS 26, built on a macOS runner because it
+# needs Xcode's iPhoneOS SDK and the metal compiler. Adapted from Bergamota-farita's chlorophyll.yml: same steps, GiaSen's dipper branch by
+# default, because that is the Chlorophyll the kernel's 30xx patches were tested with. Everything is built from source: Mesa 26.2.5 with Chlorophyll's
+# patches, libdrm 2.4.124 headers and this repository's gpu/freedreno-sweet. Nothing from Apple or Qualcomm goes into the artifact.
+# Output: chlorophyll-ios26.zip. Unzip it and give the root build RENEGADE_CHL=1 RENEGADE_CHL_DIR=<unzipped>/usr/local/lib/bgmtl.
+name: chlorophyll (iOS 26, Turnip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      chlorophyll_repo:
+        description: Chlorophyll repository on GitHub
+        default: GiaSen/Chlorophyll
+      chlorophyll_ref:
+        description: Chlorophyll branch, tag or commit
+        default: dipper
+      xcode_version:
+        description: Xcode on the runner (empty = the newest; the Metal device needs the iOS 26 SDK)
+        default: ""
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      WORK: ${{ github.workspace }}/work
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chlorophyll source
+        env:
+          CHL_REPO: ${{ inputs.chlorophyll_repo }}
+          CHL_REF: ${{ inputs.chlorophyll_ref }}
+        run: |
+          git clone -q "https://github.com/$CHL_REPO" "$WORK/chlorophyll"
+          git -C "$WORK/chlorophyll" checkout -q "$CHL_REF"
+          git -C "$WORK/chlorophyll" log --oneline -1
+          git clone -q --depth 1 --branch libdrm-2.4.124 https://gitlab.freedesktop.org/mesa/drm.git "$WORK/libdrm-src"
+
+      - name: Xcode
+        env:
+          XCODE_VERSION: ${{ inputs.xcode_version }}
+        run: |
+          if [ -n "$XCODE_VERSION" ]; then
+            XC=$(ls -d /Applications/Xcode_"$XCODE_VERSION"*.app | sort -V | tail -1)
+          else
+            XC=$(ls -d /Applications/Xcode_*.app | grep -v -i beta | sort -V | tail -1)
+          fi
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Tools
+        run: |
+          brew install bison glslang pkg-config ninja
+          python3 -m venv "$WORK/venv"
+          "$WORK/venv/bin/pip" install -q meson mako pyyaml packaging pycparser ply
+
+      - name: Turnip + libchlorophyll
+        env:
+          GPU_METAL_WORK: ${{ github.workspace }}/work
+          BERGAMOTA_GPU: ${{ github.workspace }}/gpu
+          GPU_EAGL_LIBDRM: ${{ github.workspace }}/work/libdrm-src
+          GPU_EAGL_VENV: ${{ github.workspace }}/work/venv
+          JOBS: "4"
+        run: |
+          bash "$WORK/chlorophyll/turnip/build-turnip.sh" || { tail -80 "$WORK/mesa-turnip26/setup-ios.log" 2>/dev/null; exit 1; }
+
+      - name: Metal device and inject
+        env:
+          GPU_METAL_WORK: ${{ github.workspace }}/work
+          BERGAMOTA_GPU: ${{ github.workspace }}/gpu
+        run: |
+          bash "$WORK/chlorophyll/turnip/build-metal.sh" "$WORK/out-metal"
+
+      - name: Package
+        run: |
+          P="$WORK/pkg"; mkdir -p "$P/usr/local/lib/bgmtl" "$P/LICENSES"
+          cp "$WORK/out-metal/bgmtl-inject.dylib" "$WORK/out-metal/libchlorophyll.dylib" "$WORK/out-metal/libdrm.2.dylib" "$P/usr/local/lib/bgmtl/"
+          cp "$WORK/mesa-turnip26/mesa/docs/license.rst" "$P/LICENSES/Mesa-license.rst"
+          cp "$WORK/libdrm-src/COPYING" "$P/LICENSES/libdrm-COPYING" 2>/dev/null || true
+          for f in NOTICE.md LICENSE.hackios-userland; do cp "$WORK/chlorophyll/$f" "$P/LICENSES/Chlorophyll-$f" 2>/dev/null || true; done
+          (cd "$P" && zip -qr "$WORK/chlorophyll-ios26.zip" .)
+          ls -l "$WORK/chlorophyll-ios26.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chlorophyll-ios26
+          path: work/chlorophyll-ios26.zip
+          retention-days: 30

@@ -1,0 +1,41 @@
+From: Poco F1 iOS port
+Subject: [PATCH] Poco F1: vibration and flashlight, with its own motor limit
+
+The same PMI8998 blocks as the Mi 8 (haptics at 0xc000 and flash LEDs at 0xd300 on SID 3), so the driver carries over, with one
+difference that matters: the motor. LineageOS beryllium-p0.dtsi &pmi8998_haptics has qcom,vmax-mv 2812, the Mi 8's DT 3100, so
+the Mi 8's limit would overdrive the Poco F1's motor. The limit starts at the lower value and only the Mi 8 raises it.
+Same LRA period on both (qcom,wave-play-rate-us 4878). Flashlight: led-0 and led-1 are both rear (mainline &pmi8998_flash,
+led-sources 1 and 2), 150 mA per LED as on the Mi 8. Not tested on a Poco F1 yet.
+
+diff --git a/bsd/dev/dipper_haptics.c b/bsd/dev/dipper_haptics.c
+--- a/bsd/dev/dipper_haptics.c
++++ b/bsd/dev/dipper_haptics.c
+@@ -60,7 +60,12 @@
+ #define HAP_MISC_TRIM           0x09f3u                 /* qcom,misc@900 + misc-clk-trim-error-reg 0xf3 */
+ #define HAP_PERIOD_US           4878u                   /* qcom,wave-play-rate-us */
+ #define HAP_VMAX_MV_STEP        116u
+-#define HAP_VMAX_MAX_MV         3100u                   /* qcom,vmax-mv */
++/*
++ * qcom,vmax-mv is the motor's own limit and the phones differ: Poco F1 2812 mV (beryllium-p0.dtsi), Mi 8 3100 mV. It starts
++ * at the lower one; dipper_haptics_init() raises it on the Mi 8 only.
++ */
++static uint32_t hap_vmax_max_mv = 2812u;
++#define HAP_VMAX_MAX_MV         hap_vmax_max_mv
+ #define HAP_MAX_MS              1000u
+ 
+ #define HAP_ON_HAPTICS          0x1u                    /* sweethap bits */
+@@ -426,9 +431,12 @@
+ 	if (!on) {
+ 		return;
+ 	}
+-	if (!sweet_board_is("xiaomi,dipper")) {
+-		printf("SWEET HAPTICS: sweethap=%u is for the Mi 8 (dipper): ignored\n", on);
++	if (!sweet_board_beryllium()) {
++		printf("SWEET HAPTICS: sweethap=%u is for the Mi 8 and the Poco F1: ignored\n", on);
+ 		return;
++	}
++	if (sweet_board_is("xiaomi,dipper")) {
++		hap_vmax_max_mv = 3100u;
+ 	}
+ 	thread_t th;
+ 	if (kernel_thread_start(hap_thread, (void *)(uintptr_t)on, &th) == KERN_SUCCESS) {

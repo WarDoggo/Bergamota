@@ -7,8 +7,24 @@ bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT
 git init -q "$bearssl_tmp"
-git -C "$bearssl_tmp" fetch -q --depth 1 \
-    https://www.bearssl.org/git/BearSSL "$bearssl_sha"
+fetched=0
+for try in 1 2 3; do
+    if git -C "$bearssl_tmp" fetch -q --depth 1 https://www.bearssl.org/git/BearSSL "$bearssl_sha"; then
+        fetched=1
+        break
+    fi
+    sleep $((try * 5))
+done
+if [[ $fetched == 0 ]]; then
+    # bearssl.org down (HTTP 502 on 2026-11-04): the same staged subset, kept in this repository
+    vendored="${GITHUB_WORKSPACE:-}/xnu/vendor/sweet_bearssl-${bearssl_sha:0:7}"
+    [[ -f "$vendored/LICENSE.txt" ]] || { echo "bearssl.org unreachable and no vendored copy at $vendored" >&2; exit 1; }
+    [[ ! -e libkern/crypto/sweet_bearssl ]] || { echo 'refusing to overwrite libkern/crypto/sweet_bearssl' >&2; exit 1; }
+    mkdir -p libkern/crypto/sweet_bearssl
+    cp -R "$vendored"/inc "$vendored"/src "$vendored"/LICENSE.txt libkern/crypto/sweet_bearssl/
+    echo "Staged BearSSL $bearssl_sha for SWEET from the vendored copy (bearssl.org did not answer)"
+    exit 0
+fi
 git -C "$bearssl_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
 python3 - "$bearssl_tmp" <<'PY'

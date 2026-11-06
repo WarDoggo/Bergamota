@@ -5,7 +5,7 @@ on:
     inputs:
       macos_version:
         description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era; 26.5 = xnu-12377.121.6 / iOS 26.5 era)
-        default: "15.3"
+        default: "26.5"
       xcode_version:
         description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x, 26.1 for 26.x)
         default: ""
@@ -256,8 +256,9 @@ jobs:
           path: .ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
+      # Off on the Poco F1 fork: a public repository must not publish the SDK's private headers.
       - name: Package build tree for local compiles
-        if: always()
+        if: false
         run: |
           # Generated headers, config option headers, mig output and the patched
           # source: enough to re-run any single compile command from the log locally.
@@ -272,14 +273,15 @@ jobs:
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: false
         with:
           name: xnu-buildtree
           path: buildtree.tgz
           retention-days: 7
 
+      # Off too: its symbol lists of Apple's closed libraries would land in the public artifact.
       - name: Inspect closed KDK support libs
-        if: always()
+        if: false
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
