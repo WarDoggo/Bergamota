@@ -3,6 +3,7 @@
  *   sweettouch tap X Y                     one finger, points (375x812 space of the iPhone11,8 userland)
  *   sweettouch swipe X1 Y1 X2 Y2 [MS]      drag, default 300 ms
  *   sweettouch home | lock                 Home (menu) / Power (lock) button press
+ *   sweettouch volup | voldown [N]         N presses of a volume button (default 1, 150 ms apart)
  * Events go into the HID event system (IOHIDEventSystemClientDispatchEvent) like a digitizer's, with the
  * entitlement com.apple.private.hid.client.event-dispatch (touch.entitlements). iOS 18, arm64e + pacstrip.
  */
@@ -105,8 +106,15 @@ int main(int argc, char **argv)
 		button(0x0c, 0x40);     /* consumer page, menu */
 	} else if (argc == 2 && !strcmp(argv[1], "lock")) {
 		button(0x0c, 0x30);     /* consumer page, power */
+	} else if ((argc == 2 || argc == 3) && (!strcmp(argv[1], "volup") || !strcmp(argv[1], "voldown"))) {
+		int n = argc == 3 ? atoi(argv[2]) : 1;
+		for (int i = 0; i < n && i < 32; i++) {
+			button(0x0c, argv[1][3] == 'u' ? 0xe9 : 0xea);  /* consumer page, volume increment / decrement */
+			usleep(150000);
+		}
 	} else {
-		fprintf(stderr, "usage: sweettouch tap X Y | swipe X1 Y1 X2 Y2 [MS] | home | lock   (points, 375x812)\n");
+		fprintf(stderr, "usage: sweettouch tap X Y | swipe X1 Y1 X2 Y2 [MS] | home | lock | volup [N] | voldown [N]"
+		    "   (points, 375x812)\n");
 		return 2;
 	}
 	usleep(50000);
