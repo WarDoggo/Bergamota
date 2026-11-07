@@ -1,4 +1,4 @@
-# sweetuicache for iOS 26 (arm64e, pacstrip), built on a macOS runner because it needs Xcode's iPhoneOS SDK.
+# sweetuicache and sweetsys for iOS 26 (arm64e, pacstrip), built on a macOS runner because it needs Xcode's iPhoneOS SDK.
 # Same commands as tools/sweetnet/build.sh. Only our own source goes into the artifact.
 name: sweetuicache (iOS 26)
 
@@ -32,11 +32,14 @@ jobs:
             -framework Foundation -framework Security tools/sweetnet/sweetuicache.m -o out/sweetuicache
           codesign -s - -f --entitlements tools/sweetnet/uicache.entitlements out/sweetuicache
           python3 -I tools/renegade/pacstrip.py --sign out/sweetuicache
-          ls -l out/sweetuicache
-          shasum -a 256 out/sweetuicache
+          xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall tools/sweetnet/sweetsys.c -o out/sweetsys
+          codesign -s - -f --entitlements tools/sweetnet/entitlements.plist out/sweetsys
+          python3 -I tools/renegade/pacstrip.py --sign out/sweetsys
+          ls -l out
+          shasum -a 256 out/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: sweetuicache
-          path: out/sweetuicache
+          path: out/
           retention-days: 30
