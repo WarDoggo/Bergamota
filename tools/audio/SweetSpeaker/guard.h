@@ -21,12 +21,14 @@
  * were the loudest the speaker ever gets: stricter than HakiOS at Android's level.
  *
  * Where the amps protect the speakers themselves (guard_amp_protects(); the Poco F1, where the TAS2559 runs TI's
- * tuning program with the phone's calibration as under Android, kern.sweet_audio_amp_protects = 1, xnu 3105), the power
- * stage is left out and the peak stage becomes a look-ahead limiter: the signal is delayed 1 ms, the gain eases down
- * over that millisecond before a peak that would pass -1 dBFS, holds for 30 ms and comes back with a 0.2 s time
- * constant, so it does not change within a waveform's cycle. At full volume the old stages took up to 17.8 dB off there:
- * the sound crackled and fell to a low level after a few seconds (2026-11-07). guard_test: on two loud tones, what is
- * not the tones falls from -54 dB (old stages) to -99 dB, and a steady loud tone keeps its level instead of falling 6-9 dB.
+ * tuning program with the phone's calibration as under Android, kern.sweet_audio_amp_protects = 1, xnu 3105), the
+ * high-pass and the power stage are left out and the peak stage becomes a look-ahead limiter at full scale: the signal
+ * is delayed 1 ms, the gain eases down over that millisecond before a peak that would pass 0 dBFS, holds for 30 ms and
+ * comes back with a 0.2 s time constant. Apple's chain already stops at full scale (Safari at full volume peaked at
+ * exactly 0.0 dBFS), so in normal use nothing is changed; the limiter is only a net against clipping in the 16-bit
+ * conversion. At full volume the old stages took up to 17.8 dB off there: the sound crackled and fell to a low level
+ * after a few seconds (2026-11-07). With the high-pass and a -1 dBFS ceiling, music still lost up to 3.6 dB on its
+ * loudest beats (the high-pass raises the peaks of bass-heavy sound), heard as the level ducking.
  */
 #ifndef GUARD_LOOKAHEAD
 #define GUARD_LOOKAHEAD 48u                     /* 1 ms at 48 kHz */
