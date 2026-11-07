@@ -1,0 +1,249 @@
+From: Poco F1 iOS port
+Subject: [PATCH] Poco F1: the player keeps the amps loaded, watches the TAS2560, and plays the earpiece through the amps
+
+First sound on the Poco F1 came from tools/audio/tas2559fw.py's scripts, and showed three differences from the Mi 8:
+
+ - The tuning program takes many seconds to load on the bit-banged bus. In the start path that outlasts the sysctl's 10 s
+   wait, and the player then runs with nobody watching it. The amps now stay out of reset after the off script, as
+   Android keeps them. A boot job loads the program once and the on script only powers them up.
+ - The phone's calibration shows the TAS2559 at 28.8 ohm and the TAS2560 at 6.6 ohm, and firmware configurations with one
+   device drive the TAS2559 alone, so the TAS2559 is the earpiece and the TAS2560 the loudspeaker. 3102's guess that the
+   earpiece is on the TAS2560 was wrong. pl_amp_check() now reads the TAS2560's flags too, with TI's masks.
+ - The earpiece has no WCD9340 path here. START_EAR plays through QUAT_MI2S_RX with a new amp script, slot 3, which powers
+   up the TAS2559 alone. The idle sleep stays off on this route, because the wake script is the loudspeaker's.
+
+The Mi 8 behaves as before: every change is behind sweet_board_is("xiaomi,dipper") or pl_slim().
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 673fc2e..147e8f5 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2167,6 +2167,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+  *                          PL_IDLE_S seconds of all-zero PCM shut the amp down with the off script but leave it out of
+  *                          reset, so its program stays loaded; the first non-zero sample appended wakes it, well before
+  *                          that sample plays (ring + DSP queue, about 180 ms); no fault checks while it sleeps.
++ *                          Poco F1 (3104): which 3 is the earpiece's on script. The amps stay out of reset after the
++ *                          off script, as Android keeps them: a boot job loads their program once, because that takes
++ *                          seconds on this bus, and the on script only powers them up.
+  *   kern.sweet_audio_play  write u32 op [+ data], then read struct pl_status (both in one call or apart); writable by
+  *                          any user (3046: audiomxd runs as mobile and feeds it from SweetSpeaker.driver):
+  *                          1 start (returns once the stream runs; EIO if a step failed, all undone), 2 stop now,
+@@ -2183,6 +2186,7 @@ _Static_assert(PL_ZEROS + PL_PERIOD <= PL_MAP_SIZE, "the player's ring fits its
+ #define PL_STALL_MS             1000u
+ #define PL_IDLE_S               5u              /* seconds of zeros before the amp sleeps */
+ #define TAS_ADDR                0x4cu
++#define TAS2560_ADDR            0x4du           /* Poco F1: the loudspeaker's amp */
+ enum { PL_OFF, PL_PLAYING, PL_DRAINING };
+ enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4,
+        /* 3067j, for SweetSpeaker.driver (audiomxd is not root): START on the speaker / on the earpiece (its path comes up
+@@ -2218,8 +2222,8 @@ static struct {
+ 	bool amp_idle, amp_wake;                /* asleep through silence; sound arrived while it sleeps */
+ 	uint64_t last_sound;                    /* mach_absolute_time of the last non-zero sample appended */
+ 	uint32_t sleeps, wakes;
+-	uint8_t *amp[3];                        /* [0] off, [1] on, [2] wake */
+-	uint32_t amp_len[3];
++	uint8_t *amp[4];                        /* [0] off, [1] on, [2] wake, [3] earpiece on (Poco F1, 3104) */
++	uint32_t amp_len[4];
+ 	uint32_t out;                           /* 3067: where this run plays: 0 the speaker, 1 the earpiece */
+ } pl;
+ 
+@@ -2229,10 +2233,20 @@ static struct {
+  */
+ static uint32_t au_out;
+ 
++/*
++ * 3104: the Mi 8's earpiece hangs on the WCD9340 (SLIMBUS_0_RX). The Poco F1's is the TAS2559's output, so there the
++ * earpiece plays through QUAT_MI2S_RX like the loudspeaker, with amp script [3] and the TAS2560 left off.
++ */
++static bool
++pl_slim(void)
++{
++	return pl.out && sweet_board_is("xiaomi,dipper");
++}
++
+ static uint16_t
+ pl_port(void)
+ {
+-	return pl.out ? AFE_PORT_SLIMBUS_0_RX : AFE_PORT_QUAT_MI2S_RX;
++	return pl_slim() ? AFE_PORT_SLIMBUS_0_RX : AFE_PORT_QUAT_MI2S_RX;
+ }
+ 
+ /* from gl_apr_rx: the oldest queued write is done */
+@@ -2300,11 +2314,14 @@ pl_submit(void)
+ 	}
+ }
+ 
+-/* the amp's script which (1 on, 0 off, 2 wake); off with reset also holds the amp in reset afterwards */
++/*
++ * the amp's script which (1 on, 0 off, 2 wake, 3 earpiece on); off with reset also holds the amp in reset afterwards,
++ * on the Mi 8 only: the Poco F1's amps keep their program (3104)
++ */
+ static bool
+ pl_amp(unsigned which, bool reset)
+ {
+-	static const char *const names[3] = { "off", "on", "wake" };
++	static const char *const names[4] = { "off", "on", "wake", "earpiece on" };
+ 	if (!pl.amp[which] || !ai_setup()) {
+ 		return false;
+ 	}
+@@ -2312,7 +2329,7 @@ pl_amp(unsigned which, bool reset)
+ 	size_t o = 0;
+ 	uint32_t done = 0;
+ 	int32_t e = ai_run(pl.amp[which], pl.amp_len[which], rd, sizeof(rd), &o, &done);
+-	if (!which && reset) {
++	if (!which && reset && sweet_board_is("xiaomi,dipper")) {
+ 		ai_reset_pin(false);
+ 	}
+ 	char hex[3 * 8 + 1] = "";
+@@ -2339,6 +2356,18 @@ pl_amp_check(void)
+ 		printf("SWEET AUDIO: player: amp flags %#x %#x (I2C error %d): stopping\n", pl.flags[0], pl.flags[1], e);
+ 		return false;
+ 	}
++	/* 3104: the Poco F1's TAS2560, when it plays: FLAGS_1 R38 and FLAGS_2 R39, TI's masks 0xfc and 0xc0 */
++	if (pl.out == 0 && !sweet_board_is("xiaomi,dipper")) {
++		uint8_t f[2] = { 0, 0 };
++		e = ai_write(TAS2560_ADDR, page0, 2);
++		e = e ? e : ai_write(TAS2560_ADDR, book0, 2);
++		e = e ? e : ai_write(TAS2560_ADDR, page0, 2);
++		e = e ? e : ai_read(TAS2560_ADDR, 38, f, 2);
++		if (e || (f[0] & 0xfcu) || (f[1] & 0xc0u)) {
++			printf("SWEET AUDIO: player: TAS2560 flags %#x %#x (I2C error %d): stopping\n", f[0], f[1], e);
++			return false;
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -2348,7 +2377,7 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ {
+ 	pl.state = PL_OFF;
+ 	bool a = amp ? pl_amp(0, true) : true;
+-	if (!amp && ai.rst && pl.out == 0) {
++	if (!amp && ai.rst && pl.out == 0 && sweet_board_is("xiaomi,dipper")) {
+ 		ai_reset_pin(false);
+ 	}
+ 	int st[6] = { -2, -2, -2, -2, -2, -2 };
+@@ -2366,10 +2395,10 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ 		st[3] = apr_request_port(APR_SVC_ASM, 0, 0, ASM_SESSION << 8, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &h, sizeof(h),
+ 		    APR_BASIC_RSP_RESULT, 1000);
+ 	}
+-	if (port && pl.out == 0) {              /* 3067i: the earpiece's AFE port belongs to stages 10 / 11 */
++	if (port && !pl_slim()) {               /* 3067i: the earpiece's AFE port belongs to stages 10 / 11 */
+ 		st[4] = afe_port_cmd(pl_port(), AFE_PORT_CMD_DEVICE_STOP);
+ 	}
+-	if (pl.out == 0) {                      /* the earpiece's port, channel and codec stay up (stage 10) */
++	if (!pl_slim()) {                       /* the earpiece's port, channel and codec stay up (stage 10) */
+ 		st[5] = afe_mi2s_clock(0);
+ 		(void)ap_pins(false);
+ 	}
+@@ -2398,7 +2427,7 @@ pl_start(void)
+ 	pl.amp_idle = pl.amp_wake = false;
+ 	pl.sleeps = pl.wakes = 0;
+ 	pl.out = au_out;
+-	if (pl.out == 1 && !cx.ear_up) {
++	if (pl_slim() && !cx.ear_up) {
+ 		printf("SWEET AUDIO: player: the earpiece path is not up (kern.sweet_audio_out=1 brings it up)\n");
+ 		return ENXIO;
+ 	}
+@@ -2410,7 +2439,7 @@ pl_start(void)
+ 	const char *step = "pins";
+ 	bool port = false, mapped = false, stream = false, copp = false;
+ 	uint32_t r[2];
+-	if (pl.out == 0) {
++	if (!pl_slim()) {
+ 		if (!ap_pins(true)) {
+ 			goto fail;
+ 		}
+@@ -2429,9 +2458,9 @@ pl_start(void)
+ 		port = true;
+ 	}
+ 	step = "amp on";
+-	if (pl.out == 0 && pl.amp[1]) {
++	if (!pl_slim() && pl.amp[pl.out ? 3 : 1]) {
+ 		pl.amp_used = true;
+-		if (!pl_amp(1, false)) {
++		if (!pl_amp(pl.out ? 3 : 1, false)) {
+ 			goto fail;
+ 		}
+ 	}
+@@ -2469,9 +2498,9 @@ pl_start(void)
+ 		uint16_t channels, bits;
+ 		uint32_t rate;
+ 		uint8_t map[8];
+-	} __attribute__((packed)) a = { 0, 1, pl_port(), 0xffff, ADM_NULL_COPP_TOPOLOGY, (uint16_t)(pl.out ? 1 : 2), 16, AU_RATE,
++	} __attribute__((packed)) a = { 0, 1, pl_port(), 0xffff, ADM_NULL_COPP_TOPOLOGY, (uint16_t)(pl_slim() ? 1 : 2), 16, AU_RATE,
+ 		                        { 1, 2 } };
+-	if (pl.out) {
++	if (pl_slim()) {
+ 		a.map[1] = 0;
+ 	}
+ 	step = "COPP open";
+@@ -2517,7 +2546,7 @@ pl_start(void)
+ 	pl.last_done = pl.last_check = pl.last_sound = mach_absolute_time();
+ 	pl_submit();
+ 	printf("SWEET AUDIO: player on (%s): mem map handle %#x, COPP %u, amp %s, %u writes of %u bytes queued, ring %u bytes\n",
+-	    pl.out ? "earpiece" : "speaker", pl.handle, pl.copp, pl.out ? "not used" : pl.amp_used ? "on" : "not scripted (silent)",
++	    pl.out ? "earpiece" : "speaker", pl.handle, pl.copp, pl_slim() ? "not used" : pl.amp_used ? "on" : "not scripted (silent)",
+ 	    pl.qn, PL_PERIOD, PL_RING);
+ 	return 0;
+ fail:
+@@ -2557,7 +2586,7 @@ pl_step(void)
+ 		}
+ 		pl.last_check = pl.last_sound = mach_absolute_time();
+ 	}
+-	if (pl.amp_used && pl.amp[2]) {
++	if (pl.amp_used && pl.amp[2] && pl.out == 0) {     /* the wake script is the loudspeaker's */
+ 		uint64_t t = mach_absolute_time();
+ 		if (pl.amp_idle && pl.amp_wake) {
+ 			pl.amp_wake = false;
+@@ -2703,7 +2732,7 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ 		if ((err = SYSCTL_IN(req, &which, 1))) {
+ 			return err;
+ 		}
+-		if (which > 2) {
++		if (which > 3) {
+ 			return EINVAL;
+ 		}
+ 		uint32_t len = (uint32_t)(n - 1);
+@@ -2733,9 +2762,9 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ 			return err;
+ 		}
+ 	}
+-	char text[96];
+-	snprintf(text, sizeof(text), "amp scripts: on %u bytes, off %u bytes, wake %u bytes\n", pl.amp_len[1], pl.amp_len[0],
+-	    pl.amp_len[2]);
++	char text[120];
++	snprintf(text, sizeof(text), "amp scripts: on %u bytes, off %u bytes, wake %u bytes, earpiece %u bytes\n", pl.amp_len[1],
++	    pl.amp_len[0], pl.amp_len[2], pl.amp_len[3]);
+ 	return SYSCTL_OUT(req, text, strlen(text) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_amp, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_amp_sysctl, "S",
+@@ -3952,7 +3981,7 @@ cx_stage_ear_off(void)
+ static int
+ ear_on(void)
+ {
+-	if (cx.ear_up) {
++	if (cx.ear_up || !sweet_board_is("xiaomi,dipper")) {  /* 3104: the Poco F1's earpiece needs no codec path */
+ 		return 0;
+ 	}
+ 	if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
+@@ -3980,6 +4009,10 @@ ear_off_idle(void)
+ 	if (on_ear) {
+ 		return EBUSY;
+ 	}
++	if (!sweet_board_is("xiaomi,dipper")) {
++		au_out = 0;
++		return 0;
++	}
+ 	if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
+ 		return EAGAIN;
+ 	}
+@@ -4125,7 +4158,7 @@ au_out_sysctl SYSCTL_HANDLER_ARGS
+ 	if (v != 0 && v != 1) {
+ 		return EINVAL;
+ 	}
+-	if (v == 1 && !cx.ear_up) {
++	if (v == 1 && !cx.ear_up && sweet_board_is("xiaomi,dipper")) {
+ 		if (!au_live) {
+ 			return ENXIO;
+ 		}
