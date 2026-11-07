@@ -93,7 +93,16 @@ enum {
 #define kPrefillFrames          4800u           /* zeros ahead of the first mix: room for the IO thread's jitter */
 #define kVolumeMinDB            (-48.0f)
 #define kVolumeMaxDB            0.0f
-#define kMakeupDB               12.0f           /* guard.c: Apple's speaker chain leaves 10.7-14 dB of headroom unused */
+#define kMakeupDB               12.0f           /* guard.c: the Mi 8 (its amp plays at DAC gain 2 in ROM mode) */
+/*
+ * The Poco F1 (the amps protect the speakers): no make-up. Apple's chain (VEQv2) puts its pre-gain at about 6 times the
+ * volume step's own dB: -12.4 dB at gain 0.786, -10.5 at 0.819, -6.4 at 0.890, and 0 dB at full volume (audiomxd's log,
+ * 2026-11-07). The 10.7-14 dB "headroom" seen earlier was below the top of the slider; at full volume the chain already
+ * delivers full scale, so +12 dB there drove ringtones 12 dB into the limiter (user: "crackles and switches to low
+ * volume").
+ */
+#define kProtectsMakeupDB       0.0f
+#define kInSeconds              30u             /* temporary diagnostic: per-second input peaks logged at StopIO */
 
 /* kern.sweet_audio_play (dipper_audio.c) */
 enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4, PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6,
@@ -145,6 +154,8 @@ static struct {
 	uint64_t min_fill;
 	uint32_t last_gaps;
 	unsigned gap_ms[12];
+	unsigned in_frames;                     /* temporary diagnostic (full-volume check, 2026-11-07): */
+	float in_peak[kInSeconds];              /* the loudest sample Apple's chain sent in each second of a playback */
 } gDiag;
 /* the microphone (kern.sweet_audio_rec): the reader thread fills gMicRing up to gMicWpos (kernel sample positions) */
 static UInt32 gMicIOCount;
@@ -444,8 +455,10 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	int protects = 0;
 	size_t plen = sizeof(protects);
 	if (sysctlbyname("kern.sweet_audio_amp_protects", &protects, &plen, NULL, 0) == 0 && protects == 1) {
+		guard_init(&gGuard, (float)kSampleRate, kProtectsMakeupDB);
 		guard_amp_protects(&gGuard);   /* the amps' own program guards the speakers: no power limits here */
-		os_log(gLog, "SweetSpeaker: the amps protect the speakers: guard without power limits, peaks under -1 dBFS");
+		os_log(gLog, "SweetSpeaker: the amps protect the speakers: guard without power limits, make-up %.1f dB, peaks under "
+		    "-1 dBFS", kProtectsMakeupDB);
 	}
 	pthread_t hth;
 	if (semaphore_create(mach_task_self(), &gHapSem, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS &&
@@ -1455,6 +1468,15 @@ out_io(AudioObjectID dev, bool start)
 		} else {
 			gStopHostTime = mach_absolute_time();
 			os_log(gLog, "SweetSpeaker: stop IO: the guard took at most %.1f dB off", -guard_take_min_db(&gGuard));
+			{       /* temporary diagnostic (full-volume check, 2026-11-07): does Apple's chain turn a loud sound down? */
+				char peaks[kInSeconds * 7 + 1] = "";
+				unsigned secs = (gDiag.in_frames + 47999u) / 48000u, h = 0;
+				for (unsigned s = 0; s < secs && s < kInSeconds; s++) {
+					h += (unsigned)snprintf(peaks + h, sizeof(peaks) - h, " %.1f",
+					    20.0f * log10f(fmaxf(gDiag.in_peak[s], 1e-6f)));
+				}
+				os_log(gLog, "SweetSpeaker: stop IO: the input's loudest sample in each second (dBFS):%{public}s", peaks);
+			}
 			os_log(gLog, "SweetSpeaker: stop IO: %u frames dropped, %u write errors; %u cycles of %u-%u frames, %u skips (%u frames), "
 			    "%u overlaps (%u frames); kernel ring lowest %llu bytes, %u gaps at ms %u %u %u %u %u %u %u %u %u %u %u %u", gDropped,
 			    gErrors, gDiag.cycles, gDiag.min_buf, gDiag.max_buf, gDiag.skips, gDiag.skipped, gDiag.overlaps, gDiag.overlapped,
@@ -1627,6 +1649,11 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 		} else {
 			for (UInt32 i = 0; i < n * kChannels; i++) {
 				work[i] = in[i] * g;
+			}
+			for (UInt32 i = 0; i < n && gDiag.in_frames / 48000u < kInSeconds; i++, gDiag.in_frames++) {
+				float p = fmaxf(fabsf(in[2 * i]), fabsf(in[2 * i + 1]));      /* temporary diagnostic, see StopIO */
+				unsigned s = gDiag.in_frames / 48000u;
+				gDiag.in_peak[s] = fmaxf(gDiag.in_peak[s], p);
 			}
 			guard_run(&gGuard, work, n);
 		}
