@@ -102,7 +102,6 @@ enum {
  * volume").
  */
 #define kProtectsMakeupDB       0.0f
-#define kInSeconds              30u             /* temporary diagnostic: per-second input peaks logged at StopIO */
 
 /* kern.sweet_audio_play (dipper_audio.c) */
 enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4, PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6,
@@ -154,8 +153,6 @@ static struct {
 	uint64_t min_fill;
 	uint32_t last_gaps;
 	unsigned gap_ms[12];
-	unsigned in_frames;                     /* temporary diagnostic (full-volume check, 2026-11-07): */
-	float in_peak[kInSeconds];              /* the loudest sample Apple's chain sent in each second of a playback */
 } gDiag;
 /* the microphone (kern.sweet_audio_rec): the reader thread fills gMicRing up to gMicWpos (kernel sample positions) */
 static UInt32 gMicIOCount;
@@ -1468,15 +1465,6 @@ out_io(AudioObjectID dev, bool start)
 		} else {
 			gStopHostTime = mach_absolute_time();
 			os_log(gLog, "SweetSpeaker: stop IO: the guard took at most %.1f dB off", -guard_take_min_db(&gGuard));
-			{       /* temporary diagnostic (full-volume check, 2026-11-07): does Apple's chain turn a loud sound down? */
-				char peaks[kInSeconds * 7 + 1] = "";
-				unsigned secs = (gDiag.in_frames + 47999u) / 48000u, h = 0;
-				for (unsigned s = 0; s < secs && s < kInSeconds; s++) {
-					h += (unsigned)snprintf(peaks + h, sizeof(peaks) - h, " %.1f",
-					    20.0f * log10f(fmaxf(gDiag.in_peak[s], 1e-6f)));
-				}
-				os_log(gLog, "SweetSpeaker: stop IO: the input's loudest sample in each second (dBFS):%{public}s", peaks);
-			}
 			os_log(gLog, "SweetSpeaker: stop IO: %u frames dropped, %u write errors; %u cycles of %u-%u frames, %u skips (%u frames), "
 			    "%u overlaps (%u frames); kernel ring lowest %llu bytes, %u gaps at ms %u %u %u %u %u %u %u %u %u %u %u %u", gDropped,
 			    gErrors, gDiag.cycles, gDiag.min_buf, gDiag.max_buf, gDiag.skips, gDiag.skipped, gDiag.overlaps, gDiag.overlapped,
@@ -1649,11 +1637,6 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 		} else {
 			for (UInt32 i = 0; i < n * kChannels; i++) {
 				work[i] = in[i] * g;
-			}
-			for (UInt32 i = 0; i < n && gDiag.in_frames / 48000u < kInSeconds; i++, gDiag.in_frames++) {
-				float p = fmaxf(fabsf(in[2 * i]), fabsf(in[2 * i + 1]));      /* temporary diagnostic, see StopIO */
-				unsigned s = gDiag.in_frames / 48000u;
-				gDiag.in_peak[s] = fmaxf(gDiag.in_peak[s], p);
 			}
 			guard_run(&gGuard, work, n);
 		}
