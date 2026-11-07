@@ -8,6 +8,7 @@ configuration into the register writes both amps need, as TI's driver (tas2559-c
   tas2559fw.py FW.bin --script load OUT PROGRAM CONFIG [CAL]  tas2559_set_program(): resets, defaults, program, PLL,
                                                               coefficients, and this phone's calibration (CAL.bin)
   tas2559fw.py FW.bin --script on OUT CONFIG GAIN_A GAIN_B    tas2559_enable(true): startup, DAC gains (0..15), unmute
+  tas2559fw.py FW.bin --script ear OUT CONFIG GAIN            the earpiece alone on the loaded program, DAC gain 0..15
   tas2559fw.py FW.bin --script off OUT CONFIG                 tas2559_enable(false): the shutdown sequence
 
 The script format is tas2557fw.py's (kern.sweet_audio_i2c, tools/sweetnet/sweeti2c on the phone). What differs from the Mi 8:
@@ -247,6 +248,20 @@ def script(kind, parsed, args, cal=None):
         s.read(B, 0, 0, 42, 1, 'B POWER_UP_FLAG (0xc0 set = up)')
         s.read(B, 0, 0, 38, 2, 'B FLAGS_1/2')
         s.read(B, 0, 0, 4, 1, 'B SPK_CTRL')
+    elif kind == 'ear':
+        # The earpiece alone, on the program already loaded. Android reloads the coefficients for this (configuration
+        # 13), which would take seconds here; it also drives the earpiece on this tuning in stereo, at gain 15.
+        gain = int(args[1])
+        assert 0 <= gain <= 15
+        s.read(A, 0, 0, 104, 1, 'A FLAGS_1 (cleared by the read)')
+        s.read(A, 0, 0, 108, 1, 'A FLAGS_2')
+        s.update(A, 0, 0, 6, 0x78, gain << 3)
+        s.table(STARTUP, DEV_A)
+        s.table(UNMUTE, DEV_A)
+        s.read(A, 0, 0, 100, 1, 'A POWER_UP_FLAG (0xc0 set = up)')
+        s.read(A, 0, 0, 104, 1, 'A FLAGS_1')
+        s.read(A, 0, 0, 108, 1, 'A FLAGS_2')
+        s.read(A, 0, 0, 6, 1, 'A SPK_CTRL')
     elif kind == 'off':
         dev = cfgs[int(args[0])]['devices']
         s.table(SHUTDOWN, dev)                          # tas2559_DevShutdown
