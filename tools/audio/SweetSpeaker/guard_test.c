@@ -9,6 +9,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define RATE    48000.0f
 #define BLOCK   1024u
@@ -65,6 +66,152 @@ tone(struct ss_guard *g, float freq, float amp, float secs, const float *report,
 	*peak_db = 20 * log10f(peak_all + 1e-30f);
 }
 
+/* Goertzel power of freq in x[0..n) */
+static double
+bin_power(const float *x, unsigned long n, float freq)
+{
+	double w = 2 * M_PI * freq / RATE, c = 2 * cos(w), s1 = 0, s2 = 0;
+	for (unsigned long i = 0; i < n; i++) {
+		double s0 = x[i] + c * s1 - s2;
+		s2 = s1;
+		s1 = s0;
+	}
+	return s1 * s1 + s2 * s2 - c * s1 * s2;
+}
+
+/* a sine of freq at amp for secs: the output's power over its first and last second (dB re full-scale sine), its peak
+ * (dBFS), and its distortion over the last second (harmonics 2-6 against the tone, dB) */
+static void
+tone_thd(struct ss_guard *g, float freq, float amp, float secs, float *first_db, float *last_db, float *peak_db, float *thd_db)
+{
+	static float buf[2 * BLOCK], last[48000];
+	unsigned long n = (unsigned long)(secs * RATE), done = 0, nl = 0;
+	double phase = 0, sum_first = 0, sum_last = 0;
+	float peak = 0;
+	while (done < n) {
+		unsigned k = n - done < BLOCK ? (unsigned)(n - done) : BLOCK;
+		for (unsigned i = 0; i < k; i++) {
+			float v = amp * (float)sin(phase);
+			phase += 2 * M_PI * freq / RATE;
+			buf[2 * i] = buf[2 * i + 1] = v;
+		}
+		guard_run(g, buf, k);
+		for (unsigned i = 0; i < k; i++) {
+			unsigned long t = done + i;
+			float v = buf[2 * i];
+			peak = fmaxf(peak, fabsf(v));
+			if (t >= 2400 && t < 2400 + 48000) {        /* the first second after 50 ms of settling */
+				sum_first += (double)v * v;
+			}
+			if (t >= n - 48000) {
+				sum_last += (double)v * v;
+				last[nl++] = v;
+			}
+		}
+		done += k;
+	}
+	*first_db = (float)(10 * log10(sum_first / 48000 / 0.5 + 1e-30));
+	*last_db = (float)(10 * log10(sum_last / 48000 / 0.5 + 1e-30));
+	*peak_db = 20 * log10f(peak + 1e-30f);
+	double fund = bin_power(last, nl, freq), harm = 0;
+	for (int h = 2; h <= 6; h++) {
+		harm += bin_power(last, nl, freq * h);
+	}
+	*thd_db = (float)(10 * log10(harm / fund + 1e-30));
+}
+
+/* the amps protect the speakers (guard_amp_protects, the Poco F1): the old stages against the new one at full volume */
+static void
+amp_protects_cases(void)
+{
+	struct ss_guard g;
+	float first, last, pk, thd;
+	printf("full volume, 1 kHz at -9 dBFS (a loud ringtone after Apple's chain), +12 dB make-up, 30 s:\n");
+	guard_init(&g, RATE, 12.0f);
+	tone_thd(&g, 1000, powf(10, -9 / 20.0f), 30, &first, &last, &pk, &thd);
+	printf("  Mi 8 guard:      first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, distortion %6.1f dB, lowest gain %.1f dB\n",
+	    first, last, pk, thd, guard_take_min_db(&g));
+	guard_init(&g, RATE, 12.0f);
+	guard_amp_protects(&g);
+	tone_thd(&g, 1000, powf(10, -9 / 20.0f), 30, &first, &last, &pk, &thd);
+	float lowest = guard_take_min_db(&g);
+	printf("  amps protect:    first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, distortion %6.1f dB, lowest gain %.1f dB\n",
+	    first, last, pk, thd, lowest);
+	check(pk <= -1.0f + 0.01f, "amps protect: a peak over -1 dBFS");
+	check(fabsf(last - first) < 0.1f, "amps protect: the level fell during a steady tone");
+	/* +3 dBFS peaks into a -1 dBFS ceiling: 4 dB, plus the high-pass's start-up overshoot */
+	check(lowest > -5.5f, "amps protect: more than the peak excess taken off");
+	check(thd < -60.0f, "amps protect: the limiter distorts a steady tone");
+
+	/* two tones, so the peaks come and go like music's: what is left besides the two tones is the limiter's distortion */
+	printf("  two tones (1 kHz + 3.1 kHz, each -12 dBFS), +12 dB make-up, 10 s: what is not the two tones\n");
+	for (int mode = 0; mode < 2; mode++) {
+		static float b2[2 * BLOCK], tail[48000];
+		guard_init(&g, RATE, 12.0f);
+		if (mode) {
+			guard_amp_protects(&g);
+		}
+		unsigned long n = (unsigned long)(10 * RATE), done = 0, nt = 0;
+		double ph1 = 0, ph2 = 0;
+		float a = powf(10, -12 / 20.0f), tpk = 0;
+		while (done < n) {
+			unsigned k = n - done < BLOCK ? (unsigned)(n - done) : BLOCK;
+			for (unsigned i = 0; i < k; i++) {
+				float v = a * (float)(sin(ph1) + sin(ph2));
+				ph1 += 2 * M_PI * 1000 / RATE;
+				ph2 += 2 * M_PI * 3100 / RATE;
+				b2[2 * i] = b2[2 * i + 1] = v;
+			}
+			guard_run(&g, b2, k);
+			for (unsigned i = 0; i < k; i++) {
+				tpk = fmaxf(tpk, fabsf(b2[2 * i]));
+				if (done + i >= n - 48000) {
+					tail[nt++] = b2[2 * i];
+				}
+			}
+			done += k;
+		}
+		double tot = 0;
+		for (unsigned long i = 0; i < nt; i++) {
+			tot += (double)tail[i] * tail[i];
+		}
+		double tones = 2 * (bin_power(tail, nt, 1000) + bin_power(tail, nt, 3100)) / nt;
+		float rest_db = (float)(10 * log10(fmax(tot - tones, 1e-30) / tot));
+		printf("  %-16s level %6.2f dB, peak %6.2f dBFS, everything else %6.1f dB, lowest gain %.1f dB\n",
+		    mode ? "amps protect:" : "Mi 8 guard:", 10 * log10(tot / nt / 0.5), 20 * log10f(tpk), rest_db, guard_take_min_db(&g));
+		if (mode) {
+			check(rest_db < -50.0f, "amps protect: the limiter distorts two tones");
+			check(20 * log10f(tpk) <= -1.0f + 0.01f, "amps protect: a two-tone peak over -1 dBFS");
+		}
+	}
+
+	printf("  a loud burst, then quiet: the gain comes back\n");
+	guard_init(&g, RATE, 12.0f);
+	guard_amp_protects(&g);
+	tone_thd(&g, 1000, 0.7f, 0.5f, &first, &last, &pk, &thd);
+	check(pk <= -1.0f + 0.01f, "amps protect: a burst peak over -1 dBFS");
+	guard_take_min_db(&g);
+	tone_thd(&g, 1000, powf(10, -32 / 20.0f), 2, &first, &last, &pk, &thd);
+	printf("  quiet tone after it: last second %6.2f dB (want -20.0)\n", last);
+	check(fabsf(last - (-20.0f)) < 0.2f, "amps protect: the gain did not come back after a burst");
+
+	printf("  a full-scale click from silence: never over the ceiling\n");
+	guard_init(&g, RATE, 12.0f);
+	guard_amp_protects(&g);
+	static float clk[2 * BLOCK];
+	memset(clk, 0, sizeof(clk));
+	for (unsigned i = 300; i < 306; i++) {
+		clk[2 * i] = clk[2 * i + 1] = (i & 1) ? -1.0f : 1.0f;
+	}
+	guard_run(&g, clk, BLOCK);
+	float cpk = 0;
+	for (unsigned i = 0; i < 2 * BLOCK; i++) {
+		cpk = fmaxf(cpk, fabsf(clk[i]));
+	}
+	printf("  click peak %6.2f dBFS\n", 20 * log10f(cpk + 1e-30f));
+	check(20 * log10f(cpk + 1e-30f) <= -1.0f + 0.01f, "amps protect: a click over -1 dBFS");
+}
+
 int
 main(void)
 {
@@ -109,6 +256,8 @@ main(void)
 		printf("  %5.0f Hz: %6.2f dB (Butterworth %6.2f)\n", freqs[i], gain, want[i]);
 		check(fabsf(gain - want[i]) < 0.5f, "high-pass response");
 	}
+
+	amp_protects_cases();
 
 	printf(failures ? "%d FAILED\n" : "all checks passed\n", failures);
 	return failures ? 1 : 0;
