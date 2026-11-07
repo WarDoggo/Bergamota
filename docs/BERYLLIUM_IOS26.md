@@ -11,6 +11,8 @@ This tree is GiaSen's `dipper` branch (Mi 8, same Snapdragon 845) plus the chang
 | `xnu/patches-12377/3100-beryllium-memory-tuning.patch` | Turns on the system cache, DDR and L3 tuning, which was gated to the Mi 8 although it only depends on the chip. `sweetmemtune=0` turns it off. |
 | `xnu/patches-12377/3101-beryllium-haptics-torch.patch` | Vibration and flashlight. Limits the motor to 2812 mV: the Mi 8's 3100 mV would overdrive the Poco F1's motor. |
 | `xnu/patches-12377/3102-beryllium-audio-board.patch` | Audio DSP and codec clock. Adds the second amp reset pin: the Mi 8's reset pin (gpio76) is the TAS2560's here, and the TAS2559 uses gpio12. |
+| `xnu/patches-12377/3104-beryllium-amps.patch` | The player keeps the amps out of reset, so the tuning program stays loaded. It also checks the TAS2560's fault flags and plays the earpiece through the amps. |
+| `tools/audio/tas2559fw.py` | Makes the I2C scripts for both amps from the phone's firmware and calibration. The scripts hold TI's firmware, so they stay on the phone. |
 | `xnu/patches-12377/0020-stage-bearssl.sh`, `xnu/vendor/sweet_bearssl-7bea48e` | From ferdza's fork. On GitHub Actions the kernel build no longer fails when bearssl.org is down. Other hosts need `GITHUB_WORKSPACE` set to the tree. |
 | `.github/workflows/chlorophyll.yml` | Builds the GPU library on a macOS runner. Adapted from ferdza's fork. |
 | `.github/workflows/xnu.yml` | Defaults to macOS 26.5 sources. The steps that package Apple SDK headers and closed-library symbol lists are off, so a public fork doesn't publish them. |
@@ -25,8 +27,9 @@ This tree is GiaSen's `dipper` branch (Mi 8, same Snapdragon 845) plus the chang
 | Brightness | Panel DCS commands | WLED backlight | Poco F1 path already in the tree |
 | Wi-Fi rail L23 | Refused, so left out | Voted | Gate stays correct |
 | Bluetooth | gpio45-48 | Same pins and rails | Should carry over; running next to Wi-Fi is untested here |
-| Amps | One TAS2557 | TAS2559 at 0x4c + TAS2560 at 0x4d, same I2C bus | Reset pins patched; amp scripts still to write |
-| Earpiece | Codec EAR output | Through the amps, not the codec: same QUAT MI2S line, one channel, amp firmware configuration 13 | The phone's own audio files confirm it. Speaker is configuration 14, two channels |
+| Amps | One TAS2557 | TAS2559 at 0x4c drives the earpiece (28.8 ohm), TAS2560 at 0x4d the loudspeaker (6.6 ohm), same I2C bus. The TAS2559's DSP feeds both | Test beeps play. 3102's guess that the earpiece is on the TAS2560 was wrong; 3104 corrects it |
+| Amp program | ROM mode, loads quickly | Downloaded over a bit-banged bus in about 17 s | A boot job loads it once (`org.bergamota.sweetspeaker-amp`); the on script only powers up, in 0.3 s |
+| Earpiece | Codec EAR output | Through the TAS2559 alone, not the codec: same QUAT MI2S line | Script and kernel path written, not tested |
 | Headphone jack | None | WCD9340 jack detection | New work |
 | Motor limit | 3100 mV | 2812 mV | Patched |
 | Flashlight | PMI8998 | PMI8998, both LEDs rear | Patched |
@@ -50,7 +53,8 @@ Keep all of these out of git. The device tree holds the phone's serial number, a
 | --- | --- |
 | `dtb/beryllium/dtb` | `adb pull /sys/firmware/fdt dtb/beryllium/live.dtb`, then `python3 tools/extract-dtb.py backup/boot.img dtb/beryllium --live dtb/beryllium/live.dtb` |
 | `a630_zap.mbn` | The phone's vendor firmware, split with `tools/zap-split.py` |
-| Amp firmware, for later | `tas2559_uCDSP.bin` from the phone's vendor firmware |
+| Amp firmware | `tas2559_uCDSP.bin` from the phone's vendor firmware |
+| Amp calibration | `tas2559_cal.bin` from the phone's `persist` partition |
 
 `a630_gmu.bin`, `a630_sqe.fw`, `crbtfw21.tlv` and `crnv21.bin` come from linux-firmware.
 
@@ -92,7 +96,7 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 | 4 | Bluetooth | Stays up next to Wi-Fi, then try pairing |
 | 5 | Vibration, flashlight | Both work; the log shows the 2812 mV limit |
 | 6 | Audio probe | Reads only; the log shows both amp reset pins |
-| 7 | Audio DSP | DSP runs. No sound until the amp scripts exist |
+| 7 | Audio DSP | DSP runs. The boot job loads the amps about 3 minutes after the start, and `sweetplay` plays a raw PCM file |
 
 ## Lessons from Bytesfence's real Poco F1
 
@@ -105,7 +109,8 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 
 ## Still to do with the phone
 
-- `tools/audio/tas2559fw.py`: the same job as `tas2557fw.py` for firmware device 4. The TAS2560 has a different register map.
-- Test the amp firmware configurations: 14 speaker, 12 one speaker, 13 earpiece, with the boost at 5.6 V (always on for the earpiece).
+- iOS's own sound: the 19.2 MHz clock patch to the dyld cache (`tools/renegade/timebase_cache.py`), then setting the loudspeaker gain by ear. The scripts use DAC gain 1 of 15 now; Android uses 15.
+- Earpiece test: DAC gain 7 of 15 is Android's value. Android also uses firmware configuration 13 with the boost always on; the first test uses the loaded configuration 4 without those.
+- Microphone: the Poco F1's path may differ from the Mi 8's.
 - Headphone jack detection.
 - More memory: about 3.95 GB is in use now, and the low bank could add about 1.2 GB.
