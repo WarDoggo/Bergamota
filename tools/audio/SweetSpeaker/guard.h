@@ -19,7 +19,21 @@
  *
  * Full scale is that of the amp at its current gain (DAC gain 2 of 15; Android's programs run it at 15), taken as if it
  * were the loudest the speaker ever gets: stricter than HakiOS at Android's level.
+ *
+ * Where the amps protect the speakers themselves (guard_amp_protects(); the Poco F1, where the TAS2559 runs TI's
+ * tuning program with the phone's calibration as under Android, kern.sweet_audio_amp_protects = 1, xnu 3105), the power
+ * stage is left out and the peak stage becomes a look-ahead limiter: the signal is delayed 1 ms, the gain eases down
+ * over that millisecond before a peak that would pass -1 dBFS, holds for 30 ms and comes back with a 0.2 s time
+ * constant, so it does not change within a waveform's cycle. At full volume the old stages took up to 17.8 dB off there:
+ * the sound crackled and fell to a low level after a few seconds (2026-11-07). guard_test: on two loud tones, what is
+ * not the tones falls from -54 dB (old stages) to -99 dB, and a steady loud tone keeps its level instead of falling 6-9 dB.
  */
+#ifndef GUARD_LOOKAHEAD
+#define GUARD_LOOKAHEAD 48u                     /* 1 ms at 48 kHz */
+#endif
+#ifndef GUARD_HOLD_BLOCKS
+#define GUARD_HOLD_BLOCKS 30u                   /* the gain holds for 30 look-ahead blocks (30 ms) before it releases */
+#endif
 #ifndef SWEETSPEAKER_GUARD_H
 #define SWEETSPEAKER_GUARD_H
 
@@ -33,9 +47,22 @@ struct ss_guard {
 	float power_gain, power_release;
 	float peak_gain, release, ceiling;
 	float min_gain;                         /* the lowest power x peak gain since guard_take_min() */
+	float rate;
+	int amp_protects;                       /* guard_amp_protects(): no power stage, look-ahead peaks */
+	float la_ceiling;
+	float la_delay[GUARD_LOOKAHEAD][2];     /* the last 1 ms of signal */
+	float la_blk[GUARD_HOLD_BLOCKS];        /* the lowest gain needed in each of the last 30 1-ms blocks */
+	float la_cur;                           /* ... and so far in the current block */
+	unsigned la_cur_n, la_blk_pos;
+	float la_env[GUARD_LOOKAHEAD];          /* the released gain, averaged over 1 ms into the applied gain */
+	double la_sum;
+	float la_gain, la_release;
+	unsigned la_pos;
 };
 
 void guard_init(struct ss_guard *g, float rate, float makeup_db);
+/* after guard_init: the amps protect the speakers (see above) */
+void guard_amp_protects(struct ss_guard *g);
 /* interleaved stereo Float32, in place */
 void guard_run(struct ss_guard *g, float *io, unsigned frames);
 /* nothing played for seconds: the averages fall as the speaker cools */
