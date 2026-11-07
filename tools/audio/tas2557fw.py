@@ -78,14 +78,14 @@ def data(r, drv):
     return d
 
 
-def parse(b):
+def parse(b, device=2):
     r = R(b)
     assert b[:4] == b'5552', 'not a TAS2557 firmware (magic)'
     r.p = 4
     h = dict(zip(('size', 'checksum', 'ppc', 'fw', 'driver', 'time'), (r.u32() for _ in range(6))))
     h['ddc'], h['desc'] = r.name(), r.cstr()
     h['family'], h['device'] = r.u32(), r.u32()
-    assert h['family'] == 0 and h['device'] == 2, 'not a TAS2557 dual-mono firmware'
+    assert h['family'] == 0 and h['device'] == device, 'wrong device number'
     drv = h['driver']
     plls = []
     for _ in range(r.u16()):
