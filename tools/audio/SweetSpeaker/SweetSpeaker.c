@@ -39,7 +39,8 @@
  * PlayAndRecord without DefaultToSpeaker. It shares the kernel player with "Speaker" (VirtualAudio keeps the two
  * mutually exclusive): the output whose IO started last owns the player, started on the speaker or on the earpiece
  * (kern.sweet_audio_play START_SPEAKER / START_EAR, xnu 3067j: the earpiece path comes up first if needed); when the
- * receiver's IO ends, EAR_OFF takes the earpiece path down. Mono, its own volume and mute, no speaker guard.
+ * receiver's IO ends, EAR_OFF takes the earpiece path down. Mono, its own volume and mute, no speaker guard; on the
+ * Poco F1 7.5 dB under its volume, because the amp plays the earpiece at gain 15 (kProtectsRecTrimDB).
  *
  * Logs to the unified log, subsystem com.sweet.SweetSpeaker (`sweetlog 60 SweetSpeaker`).
  */
@@ -102,6 +103,14 @@ enum {
  * volume").
  */
 #define kProtectsMakeupDB       0.0f
+/*
+ * The Poco F1's earpiece (the TAS2559 alone, xnu 3104) plays at DAC gain 15, the only gain at which the amp's program
+ * (program 0, configuration 4) judges it right: at Android's handset gain 7 a steady tone sank 15 dB within 2.5 s and
+ * stayed down; at 15 it held for 20 s (the phone's own mic, 2026-11-07). Gain 7 is 7.5 dB under 15 (measured the same
+ * way, before the protection acts), so the signal takes those 7.5 dB instead: the top of the receiver's volume plays as
+ * loud as Android's earpiece.
+ */
+#define kProtectsRecTrimDB      (-7.5f)
 
 /* kern.sweet_audio_play (dipper_audio.c) */
 enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4, PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6,
@@ -174,6 +183,7 @@ static void *mic_thread(void *arg);
 static UInt32 gRecIOCount;
 static UInt64 gRecAnchorHostTime;
 static Float32 gRecVolumeScalar = 0.75f;
+static Float32 gRecTrimDB;                      /* kProtectsRecTrimDB on the Poco F1, set once at Initialize */
 static UInt32 gRecMute;
 static AudioObjectID gOut;
 /*
@@ -215,7 +225,7 @@ receiver_gain(void)
 	if (gRecMute || gRecVolumeScalar <= 0.0f) {
 		return 0.0f;
 	}
-	return powf(10.0f, volume_db(gRecVolumeScalar) / 20.0f);
+	return powf(10.0f, (volume_db(gRecVolumeScalar) + gRecTrimDB) / 20.0f);
 }
 
 /* data comes from the IO thread only (its own buffer); start/stop from the HAL's other threads */
@@ -454,8 +464,9 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	if (sysctlbyname("kern.sweet_audio_amp_protects", &protects, &plen, NULL, 0) == 0 && protects == 1) {
 		guard_init(&gGuard, (float)kSampleRate, kProtectsMakeupDB);
 		guard_amp_protects(&gGuard);   /* the amps' own program guards the speakers: no high-pass or power limits here */
+		gRecTrimDB = kProtectsRecTrimDB;
 		os_log(gLog, "SweetSpeaker: the amps protect the speakers: guard without high-pass or power limits, make-up %.1f "
-		    "dB, peaks up to 0 dBFS", kProtectsMakeupDB);
+		    "dB, peaks up to 0 dBFS; receiver %.1f dB", kProtectsMakeupDB, gRecTrimDB);
 	}
 	pthread_t hth;
 	if (semaphore_create(mach_task_self(), &gHapSem, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS &&
