@@ -7,6 +7,7 @@
  *   sweetplay -a AMP_ON -o AMP_OFF [-w WAKE]    only register the amp's scripts (for SweetSpeaker.driver); WAKE (the on
  *                                               script without the ROM load) lets the kernel put the amp to sleep
  *                                               through silence (xnu 3048)
+ *   sweetplay -e EAR                            with the options above: the Poco F1's earpiece on script (xnu 3104)
  *   sweetplay -s                                the player's state
  *   sweetplay -x                                stop now
  *
@@ -79,7 +80,7 @@ amp_script(uint8_t which, const char *path)
 		return -1;
 	}
 	buf[0] = which;
-	char text[64];
+	char text[160];
 	size_t tlen = sizeof(text);
 	if (sysctlbyname("kern.sweet_audio_amp", text, &tlen, buf, 1 + (size_t)n) != 0) {
 		perror("kern.sweet_audio_amp");
@@ -107,11 +108,14 @@ on_int(int sig)
 int
 main(int argc, char **argv)
 {
-	const char *on = NULL, *off = NULL, *wake = NULL;
+	const char *on = NULL, *off = NULL, *wake = NULL, *ear = NULL;
 	int c;
 	struct pl_status s;
-	while ((c = getopt(argc, argv, "a:o:w:sx")) != -1) {
+	while ((c = getopt(argc, argv, "a:o:w:e:sx")) != -1) {
 		switch (c) {
+		case 'e':
+			ear = optarg;
+			break;
 		case 'a':
 			on = optarg;
 			break;
@@ -132,15 +136,16 @@ main(int argc, char **argv)
 			return 0;
 		}
 		default:
-			fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] [-w WAKE] FILE|- | sweetplay -s | sweetplay -x\n");
+			fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] [-w WAKE] [-e EAR] FILE|- | sweetplay -s | sweetplay -x\n");
 			return 2;
 		}
 	}
-	if (optind == argc && (on || off || wake)) {
-		return (on && amp_script(1, on)) || (off && amp_script(0, off)) || (wake && amp_script(2, wake)) ? 1 : 0;
+	if (optind == argc && (on || off || wake || ear)) {
+		return (off && amp_script(0, off)) || (wake && amp_script(2, wake)) || (ear && amp_script(3, ear)) ||
+		       (on && amp_script(1, on)) ? 1 : 0;
 	}
 	if (optind + 1 != argc) {
-		fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] [-w WAKE] FILE|- | sweetplay -s | sweetplay -x\n");
+		fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] [-w WAKE] [-e EAR] FILE|- | sweetplay -s | sweetplay -x\n");
 		return 2;
 	}
 	int fd = strcmp(argv[optind], "-") ? open(argv[optind], O_RDONLY) : 0;
@@ -148,7 +153,7 @@ main(int argc, char **argv)
 		perror(argv[optind]);
 		return 1;
 	}
-	if ((on && amp_script(1, on)) || (off && amp_script(0, off)) || (wake && amp_script(2, wake))) {
+	if ((off && amp_script(0, off)) || (wake && amp_script(2, wake)) || (ear && amp_script(3, ear)) || (on && amp_script(1, on))) {
 		return 1;
 	}
 	signal(SIGINT, on_int);
