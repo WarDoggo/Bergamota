@@ -210,6 +210,27 @@ amp_protects_cases(void)
 	}
 	printf("  click peak %6.2f dBFS\n", 20 * log10f(cpk + 1e-30f));
 	check(20 * log10f(cpk + 1e-30f) <= -1.0f + 0.01f, "amps protect: a click over -1 dBFS");
+
+	/* the Poco F1 as the driver runs it (kProtectsMakeupDB): at full volume Apple's chain sends full scale, its VEQv2
+	 * pre-gain is 0 dB there, so the make-up is 0 dB and the limiter only trims the last dB */
+	printf("full volume on the Poco F1: 1 kHz at 0 dBFS, no make-up, 10 s:\n");
+	guard_init(&g, RATE, 0.0f);
+	guard_amp_protects(&g);
+	tone_thd(&g, 1000, 1.0f, 10, &first, &last, &pk, &thd);
+	lowest = guard_take_min_db(&g);
+	printf("  amps protect:    first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, distortion %6.1f dB, lowest gain %.1f dB\n",
+	    first, last, pk, thd, lowest);
+	check(pk <= -1.0f + 0.01f, "no make-up: a peak over -1 dBFS");
+	check(lowest > -2.5f, "no make-up: more than the ceiling's 1 dB and the high-pass's start-up taken off");
+	check(thd < -60.0f, "no make-up: the limiter distorts a full-scale tone");
+	printf("  the same tone 12 dB lower (the slider a little under the top): untouched\n");
+	guard_init(&g, RATE, 0.0f);
+	guard_amp_protects(&g);
+	tone_thd(&g, 1000, powf(10, -12 / 20.0f), 3, &first, &last, &pk, &thd);
+	lowest = guard_take_min_db(&g);
+	printf("  amps protect:    last second %6.2f dB, peak %6.2f dBFS, lowest gain %.1f dB\n", last, pk, lowest);
+	check(fabsf(last - (-12.0f)) < 0.1f, "no make-up: a -12 dBFS tone did not come out at -12 dB");
+	check(lowest > -1.0f, "no make-up: the limiter touched a -12 dBFS tone");
 }
 
 int
