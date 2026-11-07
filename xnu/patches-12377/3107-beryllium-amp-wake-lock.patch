@@ -1,0 +1,152 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: the amp's idle and wake scripts off the player's lock
+
+After 3106 a test with silence and then a faint tone still made the HAL skip once: 5556 frames, at the moment the
+tone's first samples woke the sleeping amp. The player puts the loudspeaker's amp to sleep after 5 s of zeros and
+wakes it on the first non-zero sample; both scripts ran in pl_step with au_mtx held, and the wake script takes about
+half a second on the bit-banged bus. SweetSpeaker.driver waited in kern.sweet_audio_play, so every sound that started
+after a quiet spell lost its first tenth of a second.
+
+pl_step now only marks the off or wake script due; au_thread runs it after letting go of au_mtx (pl_job), holding only
+ai_mtx, then takes au_mtx again for the result. Sound that arrives while the off script runs wakes the amp at the next
+step. The scripts are swapped under ai_mtx, so one is never freed while it runs. The on script at start and the off
+script at stop still run under au_mtx: the driver waits for those anyway.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 0868d44..5379756 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2193,6 +2193,7 @@ _Static_assert(PL_ZEROS + PL_PERIOD <= PL_MAP_SIZE, "the player's ring fits its
+ #define PL_DEPTH                4u              /* writes queued in the DSP: 80 ms */
+ #define PL_STALL_MS             1000u
+ #define PL_IDLE_S               5u              /* seconds of zeros before the amp sleeps */
++enum { PL_JOB_NONE, PL_JOB_SLEEP, PL_JOB_WAKE };        /* 3107: pl.amp_job */
+ #define TAS_ADDR                0x4cu
+ #define TAS2560_ADDR            0x4du           /* Poco F1: the loudspeaker's amp */
+ enum { PL_OFF, PL_PLAYING, PL_DRAINING };
+@@ -2227,6 +2228,8 @@ static struct {
+ 	uint8_t flags[2];
+ 	bool amp_used;
+ 	bool check_due;                         /* 3106: au_thread runs the fault check next, without au_mtx */
++	uint8_t amp_job;                        /* 3107: au_thread runs the off (idle) or wake script next, without au_mtx */
++	uint64_t job_time;                      /* when pl_step asked for it */
+ 	bool amp_pending;                       /* an on script arrived while playing without one */
+ 	bool amp_idle, amp_wake;                /* asleep through silence; sound arrived while it sleeps */
+ 	uint64_t last_sound;                    /* mach_absolute_time of the last non-zero sample appended */
+@@ -2331,11 +2334,8 @@ static bool
+ pl_amp(unsigned which, bool reset)
+ {
+ 	static const char *const names[4] = { "off", "on", "wake", "earpiece on" };
+-	if (!pl.amp[which]) {
+-		return false;
+-	}
+-	lck_mtx_lock(&ai_mtx);
+-	if (!ai_setup()) {
++	lck_mtx_lock(&ai_mtx);                  /* 3107: the scripts are swapped under ai_mtx */
++	if (!pl.amp[which] || !ai_setup()) {
+ 		lck_mtx_unlock(&ai_mtx);
+ 		return false;
+ 	}
+@@ -2612,21 +2612,11 @@ pl_step(void)
+ 		uint64_t t = mach_absolute_time();
+ 		if (pl.amp_idle && pl.amp_wake) {
+ 			pl.amp_wake = false;
+-			if (!pl_amp(2, false)) {
+-				pl_teardown("amp wake failed", true, true, true, true, true);
+-				return;
+-			}
+-			pl.amp_idle = false;
+-			pl.wakes++;
+-			pl.last_check = t;
++			pl.amp_job = PL_JOB_WAKE;       /* 3107: pl_job runs the script once au_mtx is let go */
++			pl.job_time = t;
+ 		} else if (!pl.amp_idle && t - pl.last_sound > one_s * PL_IDLE_S) {
+-			if (pl_amp(0, false)) {
+-				pl.amp_idle = true;
+-				pl.amp_wake = false;
+-				pl.sleeps++;
+-			} else {
+-				pl.last_sound = t;      /* still on, the fault checks go on: try again after PL_IDLE_S */
+-			}
++			pl.amp_job = PL_JOB_SLEEP;
++			pl.job_time = t;
+ 		}
+ 	}
+ 	pl_submit();
+@@ -2636,7 +2626,7 @@ pl_step(void)
+ 		pl_teardown("stalled", pl.amp_used, true, true, true, true);
+ 	} else if (pl.state == PL_DRAINING && !pl.qn && pl.spos == pl.wpos) {
+ 		pl_teardown("drained", pl.amp_used, true, true, true, true);
+-	} else if (pl.amp_used && !pl.amp_idle && now - pl.last_check >= one_s) {
++	} else if (pl.amp_used && !pl.amp_idle && !pl.amp_job && now - pl.last_check >= one_s) {
+ 		pl.last_check = now;
+ 		pl.check_due = true;
+ 	}
+@@ -2664,6 +2654,37 @@ pl_check(void)
+ 	lck_mtx_unlock(&au_mtx);
+ }
+ 
++/*
++ * 3107: the amp's off (idle) and wake scripts, from au_thread after it let go of au_mtx, like pl_check. The wake
++ * script takes about half a second on the bus; with au_mtx held, kern.sweet_audio_play waited for it and the HAL
++ * skipped the start of every sound after PL_IDLE_S of silence. Sound appended while the off script runs (pl.amp_wake
++ * stays false while the amp is not yet idle) wakes it at the next step. au_thread drops a job when the player is off,
++ * and only au_thread stops it, so the result belongs to the same player run.
++ */
++static void
++pl_job(uint8_t job)
++{
++	bool ok = pl_amp(job == PL_JOB_WAKE ? 2 : 0, false);
++	lck_mtx_lock(&au_mtx);
++	uint64_t t = mach_absolute_time();
++	if (pl.state != PL_OFF) {
++		if (job == PL_JOB_WAKE && ok) {
++			pl.amp_idle = false;
++			pl.wakes++;
++			pl.last_check = t;
++		} else if (job == PL_JOB_WAKE) {
++			pl_teardown("amp wake failed", true, true, true, true, true);
++		} else if (ok) {
++			pl.amp_idle = true;
++			pl.amp_wake = pl.last_sound > pl.job_time;
++			pl.sleeps++;
++		} else {
++			pl.last_sound = t;              /* still on, the fault checks go on: try again after PL_IDLE_S */
++		}
++	}
++	lck_mtx_unlock(&au_mtx);
++}
++
+ static int ear_on(void);
+ static int ear_off_idle(void);
+ 
+@@ -2786,13 +2807,15 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ 			kfree_data(s, len);
+ 			return err;
+ 		}
+-		lck_mtx_lock(&au_mtx);
++		lck_mtx_lock(&ai_mtx);                  /* 3107: pl_job runs a script under ai_mtx alone */
+ 		uint8_t *old = pl.amp[which];
+ 		uint32_t old_len = pl.amp_len[which];
+ 		pl.amp[which] = s;
+ 		pl.amp_len[which] = len;
+ 		s = old;
+ 		len = old_len;
++		lck_mtx_unlock(&ai_mtx);
++		lck_mtx_lock(&au_mtx);
+ 		if (which == 1 && pl.state != PL_OFF && !pl.amp_used) {
+ 			pl.amp_pending = true;
+ 		}
+@@ -4644,7 +4667,12 @@ au_thread(void *arg, wait_result_t w)
+ 			bool playing = pl.state != PL_OFF || pl.req || rec.state == REC_RUNNING;
+ 			bool check = pl.check_due;
+ 			pl.check_due = false;
++			uint8_t job = pl.state != PL_OFF ? pl.amp_job : (uint8_t)PL_JOB_NONE;
++			pl.amp_job = PL_JOB_NONE;
+ 			lck_mtx_unlock(&au_mtx);
++			if (job != PL_JOB_NONE) {
++				pl_job(job);
++			}
+ 			if (check) {
+ 				pl_check();
+ 			}
