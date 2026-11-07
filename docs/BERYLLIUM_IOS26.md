@@ -109,7 +109,7 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 
 ## Still to do with the phone
 
-- Volume: the scripts use DAC gain 1 of 15 on both amps; Android uses 15. Raise it by ear, one step at a time. The 19.2 MHz clock patch (`tools/renegade/timebase_cache.py`) is on the phone: 8 of the 85 cache files change, and a message tone from iOS played with no dropped frames or gaps.
+- Volume: tried by ear from DAC gain 1 to Android's 15 with no amp faults; the user picked 12 of 15, now the scripts' default. The 19.2 MHz clock patch (`tools/renegade/timebase_cache.py`) is on the phone: 8 of the 85 cache files change, and a message tone from iOS played with no dropped frames or gaps.
 - Earpiece test: DAC gain 7 of 15 is Android's value. Android also uses firmware configuration 13 with the boost always on; the first test uses the loaded configuration 4 without those.
 - Microphone: the Poco F1's path may differ from the Mi 8's.
 - Headphone jack detection.
