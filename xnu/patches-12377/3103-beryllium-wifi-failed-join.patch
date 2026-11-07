@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 706de3e..df0d772 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -6389,6 +6389,14 @@ sta_set_state(int s)
+ 
+ static void sta_ps_mode(uint32_t on, const char *what);
+ 
++/*
++ * 3103: boot-arg wlft (bits, default 0 = off), to fail or steer a join on demand.
++ * 1 = the first join of the boot goes to a wrong BSSID
++ * 8 = the first join of the boot prefers 5 GHz
++ */
++static uint32_t sta_wlft;
++static bool sta_wlft_done, sta_join_failed;
++
+ /* tear down whatever was set up (ST_DOWN does it in steps); the result stays (a failed join reports it) */
+ static void
+ sta_teardown_start(uint16_t reason)
+@@ -6447,6 +6455,7 @@ static void
+ sta_fail(int result, const char *why)
+ {
+ 	printf("SWEET WLAN sta: join FAILED in %s: %s (result %d)\n", st_name[sta.state], why, result);
++	sta_join_failed = true;
+ 	ipc_note(" sta FAIL %s/%d;", st_name[sta.state], result);
+ 	lck_mtx_lock(&sta_lock);
+ 	bool report = !sta.req_pending;
+@@ -6480,14 +6489,20 @@ sta_pick_bss(void)
+ 		if (has_rsn != (sta.req.rsn_ie_len != 0)) {
+ 			continue;
+ 		}
+-		if (b->rssi > best_rssi) {
++		int score = b->rssi + (((sta_wlft & 8) && !sta_wlft_done && b->mhz > 4900) ? 200 : 0);
++		if (score > best_rssi) {
+ 			best = (int)i;
+-			best_rssi = b->rssi;
++			best_rssi = score;
+ 		}
+ 	}
+ 	if (best >= 0 && sweet_wlan_bss_get((unsigned)best, b) == 0) {
+ 		sta.bss = best;
+ 		memcpy(sta.bssid, b->bssid, 6);
++		if ((sta_wlft & 1) && !sta_wlft_done) {
++			sta.bssid[5] ^= 0x55;
++			printf("SWEET WLAN sta: wlft: this join goes to a wrong BSSID\n");
++		}
++		sta_wlft_done = true;
+ 		sta.mhz = b->mhz;
+ 		sta.beacon_int = b->beacon_int;
+ 		sta.ap_cap = b->cap;
+@@ -6918,6 +6933,26 @@ sta_step(void)
+ 				printf("SWEET WLAN sta: no VDEV_STOPPED in 2 s (%u WMI commands still queued: dropped)\n", sta.wq_n);
+ 			}
+ 			sta.wq_n = 0;
++			/*
++			 * 3103: after a failed join the firmware held every later management frame on this vdev until a reboot
++			 * (never sent, status 1 at PEER_DELETE, both bands), so nothing could join again. A normal leave does not
++			 * do this. Delete and create the vdev, as at startup (scan_step 8-10); only once it has really stopped,
++			 * since a join can also fail while a scan is still running on it.
++			 */
++			if (sta_join_failed && sta.vdev_started && sta.stopped) {
++				static const uint32_t psp[3][3] = { { 0, 0, 0 }, { 0, 1, 1 }, { 0, 2, 0 } };
++				uint8_t b[64];
++				uint32_t del = 0, cre[5] = { 0, 2, 0, 0, 0 }, enc[3] = { 0, 0x30, 1 };
++				memcpy(&cre[3], scan_mac, 6);
++				sta_wmi(b, scan_cmd(b, 0x5002, 87, &del, 4), "vdev delete");
++				sta_wmi(b, scan_cmd(b, 0x5001, 86, cre, 20), "vdev create");
++				sta_wmi(b, scan_cmd(b, 0x5008, 95, enc, 12), "vdev tx encap");
++				for (unsigned k = 0; k < 3; k++) {
++					sta_wmi(b, scan_cmd(b, 0x9002, 109, psp[k], 12), "sta power save param");
++				}
++				printf("SWEET WLAN sta: vdev deleted and created again after the failed join\n");
++			}
++			sta_join_failed = false;
+ 			sta_ps_mode(1, "power save on (no channel)");   /* 3036: as at VDEV_CREATE */
+ 			sta.vdev_started = false;
+ 			sta.peer_mapped = false;
+@@ -9979,6 +10014,7 @@ beryllium_wlan_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("sweetwlandelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweetwlanps", &sta_ps_ms, sizeof(sta_ps_ms));
++	(void)PE_parse_boot_argn("wlft", &sta_wlft, sizeof(sta_wlft));
+ 	/* Bluetooth firmware (stage 2): sweetbtfw=1 (default) downloads rampatch + NVM when the files exist */
+ 	wl.bt_fw = 1;
+ 	wl.bt_baud = 3000000;           /* 3200000 is the dtsi max-speed and also has an exact S6 rate */
