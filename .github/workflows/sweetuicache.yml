@@ -13,6 +13,7 @@ on:
       - tools/sweetnet/sweettorch.m
       - tools/sweetnet/sweeti2c.c
       - tools/sweetnet/sweetplay.c
+      - tools/sweetnet/sweettouch.c
       - tools/audio/SweetSpeaker/**
 
 jobs:
@@ -69,6 +70,11 @@ jobs:
             -framework AVFAudio -framework AudioToolbox tools/sweetnet/sweetaqin.m -o out/sweetaqin
           codesign -s - -f --entitlements tools/sweetnet/mic.entitlements out/sweetaqin
           python3 -I $P --sign out/sweetaqin
+          # synthetic touch and buttons over SSH (volume presses for the full-volume speaker tests)
+          xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \
+            tools/sweetnet/sweettouch.c -o out/sweettouch
+          codesign -s - -f --entitlements tools/sweetnet/touch.entitlements out/sweettouch
+          python3 -I $P --sign out/sweettouch
           # tools/audio/SweetSpeaker/build.sh, plus the plug-in header: Apple ships it in the macOS SDK only.
           # It is used on this runner while compiling and is not part of the artifact.
           INC=$PWD/inc
