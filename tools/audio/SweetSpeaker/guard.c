@@ -9,6 +9,10 @@
 #define RELEASE_S       0.043f
 #define SHORT_S         0.010f
 #define POWER_RELEASE_S 0.100f
+#define LA_PEAK_DBFS    (-1.0f)                 /* guard_amp_protects(): under the 16-bit conversion's clipping */
+#ifndef LA_RELEASE_S
+#define LA_RELEASE_S    0.2f                    /* after the hold; 0.4 s was slow to come back after a burst */
+#endif
 
 static const float kTau[3] = { 0.2f, 3.0f, 60.0f };
 static const float kLimitDB[3] = { -3.0f, -6.0f, -9.0f };     /* under the power of a full-scale sine (0.5) */
@@ -17,6 +21,7 @@ void
 guard_init(struct ss_guard *g, float rate, float makeup_db)
 {
 	memset(g, 0, sizeof(*g));
+	g->rate = rate;
 	g->makeup = powf(10.0f, makeup_db / 20.0f);
 	/* RBJ cookbook high-pass, Q = 1/sqrt(2) (Butterworth) */
 	float w0 = 2.0f * (float)M_PI * HPF_HZ / rate, c = cosf(w0), alpha = sinf(w0) / (2.0f * (float)M_SQRT1_2);
@@ -40,6 +45,70 @@ guard_init(struct ss_guard *g, float rate, float makeup_db)
 	g->min_gain = 1.0f;
 }
 
+static void
+la_reset(struct ss_guard *g)
+{
+	memset(g->la_delay, 0, sizeof(g->la_delay));
+	for (unsigned k = 0; k < GUARD_LOOKAHEAD; k++) {
+		g->la_env[k] = 1.0f;
+	}
+	for (unsigned k = 0; k < GUARD_HOLD_BLOCKS; k++) {
+		g->la_blk[k] = 1.0f;
+	}
+	g->la_cur = 1.0f;
+	g->la_cur_n = 0;
+	g->la_blk_pos = 0;
+	g->la_sum = GUARD_LOOKAHEAD;
+	g->la_gain = 1.0f;
+	g->la_pos = 0;
+}
+
+void
+guard_amp_protects(struct ss_guard *g)
+{
+	g->amp_protects = 1;
+	g->la_ceiling = powf(10.0f, LA_PEAK_DBFS / 20.0f);
+	g->la_release = 1.0f - expf(-1.0f / (g->rate * LA_RELEASE_S));
+	la_reset(g);
+}
+
+/*
+ * One sample through the look-ahead peak stage. The output is the input of GUARD_LOOKAHEAD - 1 samples ago, times the
+ * mean of the released gain over the last GUARD_LOOKAHEAD samples. Each released gain is at most the lowest gain needed
+ * over the last 30 to 31 ms (the hold), which always covers the last GUARD_LOOKAHEAD samples, so all the gains averaged
+ * for a sample were at most what that sample needs: no output passes the ceiling. The hold keeps the gain still between
+ * the peaks of a low note, whose waveform would otherwise be reshaped (2026-11-07: two tones 100 Hz apart, everything
+ * but the tones at -28 dB without a hold).
+ */
+static void
+la_step(struct ss_guard *g, const float v[2], float peak, float *out)
+{
+	unsigned pos = g->la_pos;
+	g->la_cur = fminf(g->la_cur, peak > g->la_ceiling ? g->la_ceiling / peak : 1.0f);
+	g->la_delay[pos][0] = v[0];
+	g->la_delay[pos][1] = v[1];
+	float hold = g->la_cur;
+	for (unsigned k = 0; k < GUARD_HOLD_BLOCKS; k++) {
+		hold = fminf(hold, g->la_blk[k]);
+	}
+	if (++g->la_cur_n == GUARD_LOOKAHEAD) {
+		g->la_blk[g->la_blk_pos] = g->la_cur;
+		g->la_blk_pos = (g->la_blk_pos + 1) % GUARD_HOLD_BLOCKS;
+		g->la_cur = 1.0f;
+		g->la_cur_n = 0;
+	}
+	float e = fminf(hold, g->la_gain + (1.0f - g->la_gain) * g->la_release);
+	g->la_gain = e;
+	g->la_sum += (double)e - (double)g->la_env[pos];
+	g->la_env[pos] = e;
+	float s = fminf(1.0f, (float)(g->la_sum / GUARD_LOOKAHEAD));
+	unsigned old = (pos + 1) % GUARD_LOOKAHEAD;     /* written GUARD_LOOKAHEAD - 1 samples ago */
+	out[0] = g->la_delay[old][0] * s;
+	out[1] = g->la_delay[old][1] * s;
+	g->la_pos = old;
+	g->min_gain = fminf(g->min_gain, s);
+}
+
 void
 guard_run(struct ss_guard *g, float *io, unsigned frames)
 {
@@ -54,6 +123,10 @@ guard_run(struct ss_guard *g, float *io, unsigned frames)
 			g->y1[ch] = y;
 			v[ch] = y;
 			p = fmaxf(p, y * y);            /* one speaker: the louder channel is what it may get */
+		}
+		if (g->amp_protects) {                  /* the amps' own protection does the power stage's job */
+			la_step(g, v, sqrtf(p), &io[2 * i]);
+			continue;
 		}
 		/* the largest gain whose output keeps each average at or under its limit: avg + c (g^2 p - avg) <= limit */
 		g->p_short += g->c_short * (p - g->p_short);
@@ -102,6 +175,9 @@ guard_rest(struct ss_guard *g, float seconds)
 	memset(g->y2, 0, sizeof(g->y2));
 	g->p_short *= expf(-seconds / SHORT_S);
 	g->peak_gain = 1.0f;
+	if (g->amp_protects) {
+		la_reset(g);
+	}
 }
 
 float
