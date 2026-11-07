@@ -17,7 +17,9 @@
  * The amp's on/off scripts come from TI's firmware and are registered by root (`dipper-speaker.sh amp-register`);
  * without them the stream runs and the amp stays off. ROM mode has no speaker protection, so everything goes through
  * the speaker's guard (guard.c: +12 dB make-up for Apple's n104_speaker_general chain, 200 Hz high-pass, power limits
- * over 0.2/3/60 s, peaks at most -3 dBFS) after the volume control.
+ * over 0.2/3/60 s, peaks at most -3 dBFS) after the volume control. Where the kernel says the amps protect the speakers
+ * themselves (kern.sweet_audio_amp_protects = 1, the Poco F1, xnu 3105), the guard has no power limits and holds peaks
+ * under -1 dBFS with a look-ahead limiter instead.
  *
  * A second device, UID "Actuator" (1 channel), is the vibration motor: VirtualAudio's actuator device
  * (n104_actuator_general) renders iOS's haptics there when MobileGestalt says closed-loop haptics (ADT /product/haptics),
@@ -439,6 +441,12 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	gHost = inHost;
 	gLog = os_log_create("com.sweet.SweetSpeaker", "driver");
 	guard_init(&gGuard, (float)kSampleRate, kMakeupDB);
+	int protects = 0;
+	size_t plen = sizeof(protects);
+	if (sysctlbyname("kern.sweet_audio_amp_protects", &protects, &plen, NULL, 0) == 0 && protects == 1) {
+		guard_amp_protects(&gGuard);   /* the amps' own program guards the speakers: no power limits here */
+		os_log(gLog, "SweetSpeaker: the amps protect the speakers: guard without power limits, peaks under -1 dBFS");
+	}
 	pthread_t hth;
 	if (semaphore_create(mach_task_self(), &gHapSem, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS &&
 	    pthread_create(&hth, NULL, haptic_thread, NULL) == 0) {
