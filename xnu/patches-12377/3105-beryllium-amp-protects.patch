@@ -1,0 +1,39 @@
+From: Poco F1 iOS port
+Subject: [PATCH] Poco F1: tell the speaker driver that the amps protect the speakers
+
+At full volume SweetSpeaker.driver's guard took up to 17.8 dB off a ringtone on the Poco F1: the sound crackled and
+dropped to a low volume after a few seconds. The guard stands in for the speaker protection the Mi 8's TAS2557 lacks in
+ROM mode. On the Poco F1 the TAS2559 runs TI's tuning program with the phone's calibration, as under Android, so the
+protection is already there and the guard only got in the way.
+
+kern.sweet_audio_amp_protects reads 1 on the Poco F1 and 0 on the Mi 8. The driver reads it once at start; an older
+kernel without it leaves the driver's full guard on.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 147e8f5..63bc937 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -4183,6 +4183,23 @@ au_out_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_out, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_out_sysctl, "I",
+     "Mi 8 player output: 0 speaker, 1 earpiece (WCD9340 EAR; brings the path up) (3067)");
+ 
++/*
++ * kern.sweet_audio_amp_protects (3105), read-only: 1 where the amps protect the speakers themselves, so
++ * SweetSpeaker.driver leaves the power limiting to them. On the Poco F1 the boot job loads TI's tuning program with the
++ * phone's calibration into the TAS2559, whose DSP guards both speakers as it does under Android (without that program
++ * the amp scripts are never registered, so the amps stay off). The Mi 8's TAS2557 plays in ROM mode with no
++ * protection: there the driver's guard is the only one, and this reads 0.
++ */
++static int
++au_amp_protects_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_board_beryllium() ? 1 : 0;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_amp_protects, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    au_amp_protects_sysctl, "I", "1: the amps protect the speakers (Poco F1), the speaker driver's guard steps back (3105)");
++
+ /* kern.sweet_ear_gain: (EAR PA index << 8) | (uint8_t)RX0 digital dB, applied at once when the earpiece is up */
+ static int
+ ear_gain_sysctl SYSCTL_HANDLER_ARGS
