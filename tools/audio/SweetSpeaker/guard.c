@@ -9,7 +9,7 @@
 #define RELEASE_S       0.043f
 #define SHORT_S         0.010f
 #define POWER_RELEASE_S 0.100f
-#define LA_PEAK_DBFS    (-1.0f)                 /* guard_amp_protects(): under the 16-bit conversion's clipping */
+#define LA_PEAK_DBFS    0.0f                    /* guard_amp_protects(): only what the 16-bit conversion would clip */
 #ifndef LA_RELEASE_S
 #define LA_RELEASE_S    0.2f                    /* after the hold; 0.4 s was slow to come back after a burst */
 #endif
@@ -116,6 +116,11 @@ guard_run(struct ss_guard *g, float *io, unsigned frames)
 		float v[2], p = 0.0f;
 		for (int ch = 0; ch < 2; ch++) {
 			float x = io[2 * i + ch] * g->makeup;
+			if (g->amp_protects) {          /* the amps' program shapes the speaker's low end: no high-pass here */
+				v[ch] = x;
+				p = fmaxf(p, x * x);
+				continue;
+			}
 			float y = g->b0 * x + g->b1 * g->x1[ch] + g->b2 * g->x2[ch] - g->a1 * g->y1[ch] - g->a2 * g->y2[ch];
 			g->x2[ch] = g->x1[ch];
 			g->x1[ch] = x;
