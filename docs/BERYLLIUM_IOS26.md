@@ -27,7 +27,7 @@ This tree is GiaSen's `dipper` branch (Mi 8, same Snapdragon 845) plus the chang
 | Brightness | Panel DCS commands | WLED backlight | Poco F1 path already in the tree |
 | Wi-Fi rail L23 | Refused, so left out | Voted | Gate stays correct |
 | Bluetooth | gpio45-48 | Same pins and rails | Should carry over; running next to Wi-Fi is untested here |
-| Amps | One TAS2557 | TAS2559 at 0x4c drives the earpiece (28.8 ohm), TAS2560 at 0x4d the loudspeaker (6.6 ohm), same I2C bus. The TAS2559's DSP feeds both | Test beeps play. 3102's guess that the earpiece is on the TAS2560 was wrong; 3104 corrects it |
+| Amps | One TAS2557 | TAS2559 at 0x4c drives the earpiece (28.8 ohm), TAS2560 at 0x4d the loudspeaker (6.6 ohm), same I2C bus. The TAS2559's DSP feeds both | iOS's own sound plays clean through both. 3102's guess that the earpiece is on the TAS2560 was wrong; 3104 corrects it |
 | Amp program | ROM mode, loads quickly | Downloaded over a bit-banged bus in about 17 s | A boot job loads it once (`org.bergamota.sweetspeaker-amp`); the on script only powers up, in 0.3 s |
 | Earpiece | Codec EAR output | Through the TAS2559 alone, not the codec: same QUAT MI2S line | Script and kernel path written, not tested |
 | Headphone jack | None | WCD9340 jack detection | New work |
@@ -109,7 +109,7 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 
 ## Still to do with the phone
 
-- iOS's own sound: the 19.2 MHz clock patch to the dyld cache (`tools/renegade/timebase_cache.py`), then setting the loudspeaker gain by ear. The scripts use DAC gain 1 of 15 now; Android uses 15.
+- Volume: the scripts use DAC gain 1 of 15 on both amps; Android uses 15. Raise it by ear, one step at a time. The 19.2 MHz clock patch (`tools/renegade/timebase_cache.py`) is on the phone: 8 of the 85 cache files change, and a message tone from iOS played with no dropped frames or gaps.
 - Earpiece test: DAC gain 7 of 15 is Android's value. Android also uses firmware configuration 13 with the boost always on; the first test uses the loaded configuration 4 without those.
 - Microphone: the Poco F1's path may differ from the Mi 8's.
 - Headphone jack detection.
