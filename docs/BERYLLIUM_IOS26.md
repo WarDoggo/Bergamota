@@ -113,7 +113,8 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 ## Still to do with the phone
 
 - Volume: tried by ear from DAC gain 1 to Android's 15 with no amp faults; the user picked 12 of 15, now the scripts' default. The 19.2 MHz clock patch (`tools/renegade/timebase_cache.py`) is on the phone: 8 of the 85 cache files change, and a message tone from iOS played with no dropped frames or gaps.
-- Full volume: at full volume Apple's speaker chain (the iPhone 11's) already reaches full scale, so the driver adds no make-up here. A loud tone held its level for 28 s with no skips and no amp faults. Waiting for the user's listen.
+- Full volume: at full volume Apple's speaker chain (the iPhone 11's) already reaches full scale, so the driver adds no make-up here. A loud tone held its level for 28 s with no skips and no amp faults. The user then heard no crackle, but the level kept dipping: the driver's 200 Hz bass cut raised the peaks of bass-heavy music into its -1 dBFS limiter (up to 3.6 dB off in Safari). Where the amps protect the speakers, the guard now has no bass cut and its limiter sits at 0 dBFS, so it takes nothing off (guard_test: full-scale 1 kHz and -3 dBFS 150 Hz pass untouched). Waiting for the user's listen.
+- Apple's speaker protection (`spp3`, AUSpeakerProtectionV3) runs open-loop here: MobileGestalt has no SpTS speaker data for it and the amps send it no feedback. On a steady -3 dBFS 150 Hz tone at full volume it lowers the output 2.7 dB over 25 s and keeps going; 1 kHz at loud-music power is untouched. Its settings are not in any file on the phone (only built-in defaults in the dyld cache).
 - Earpiece test: DAC gain 7 of 15 is Android's value. Android also uses firmware configuration 13 with the boost always on; the first test uses the loaded configuration 4 without those.
 - Microphone: the Poco F1's path may differ from the Mi 8's.
 - Headphone jack detection.
