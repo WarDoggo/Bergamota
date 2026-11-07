@@ -53,8 +53,17 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc -framework Foundation tools/sweetnet/sweetlog.m -o out/sweetlog
           codesign -s - -f --entitlements tools/sweetnet/log.entitlements out/sweetlog
           python3 -I $P --sign out/sweetlog
-          sh tools/audio/SweetSpeaker/build.sh
-          cp -R research/sweetnet/ios18/SweetSpeaker.driver out/
+          # tools/audio/SweetSpeaker/build.sh, plus the plug-in header: Apple ships it in the macOS SDK only.
+          # It is used on this runner while compiling and is not part of the artifact.
+          INC=$PWD/inc
+          mkdir -p "$INC/CoreAudio" out/SweetSpeaker.driver
+          cp "$(xcrun --sdk macosx --show-sdk-path)"/System/Library/Frameworks/CoreAudio.framework/Headers/*.h "$INC/CoreAudio/"
+          cp tools/audio/SweetSpeaker/Info.plist out/SweetSpeaker.driver/Info.plist
+          xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=26.0 -O2 -Wall -Wextra -bundle -idirafter "$INC" \
+            -framework CoreAudio -framework CoreFoundation tools/audio/SweetSpeaker/SweetSpeaker.c tools/audio/SweetSpeaker/guard.c \
+            -o out/SweetSpeaker.driver/SweetSpeaker
+          python3 -I $P --sign out/SweetSpeaker.driver/SweetSpeaker
+          codesign -s - -f out/SweetSpeaker.driver
           ls -lR out
           shasum -a 256 out/* out/SweetSpeaker.driver/SweetSpeaker || true
 
