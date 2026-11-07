@@ -11,6 +11,8 @@ on:
       - tools/sweetnet/sweetuicache.m
       - tools/sweetnet/uicache.entitlements
       - tools/sweetnet/sweettorch.m
+      - tools/sweetnet/sweeti2c.c
+      - tools/sweetnet/sweetplay.c
       - tools/audio/SweetSpeaker/**
 
 jobs:
@@ -53,6 +55,20 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc -framework Foundation tools/sweetnet/sweetlog.m -o out/sweetlog
           codesign -s - -f --entitlements tools/sweetnet/log.entitlements out/sweetlog
           python3 -I $P --sign out/sweetlog
+          # the audio test tools
+          for T in sweeti2c sweetplay sweetapr sweetpool; do
+            xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall tools/sweetnet/$T.c -o out/$T
+            codesign -s - -f --entitlements tools/sweetnet/entitlements.plist out/$T
+            python3 -I $P --sign out/$T
+          done
+          xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework AudioToolbox -framework CoreFoundation \
+            tools/sweetnet/sweetaq.c -o out/sweetaq
+          codesign -s - -f --entitlements tools/sweetnet/entitlements.plist out/sweetaq
+          python3 -I $P --sign out/sweetaq
+          xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation \
+            -framework AVFAudio -framework AudioToolbox tools/sweetnet/sweetaqin.m -o out/sweetaqin
+          codesign -s - -f --entitlements tools/sweetnet/mic.entitlements out/sweetaqin
+          python3 -I $P --sign out/sweetaqin
           # tools/audio/SweetSpeaker/build.sh, plus the plug-in header: Apple ships it in the macOS SDK only.
           # It is used on this runner while compiling and is not part of the artifact.
           INC=$PWD/inc
