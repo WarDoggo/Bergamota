@@ -12,6 +12,9 @@ This tree is GiaSen's `dipper` branch (Mi 8, same Snapdragon 845) plus the chang
 | `xnu/patches-12377/3101-beryllium-haptics-torch.patch` | Vibration and flashlight. Limits the motor to 2812 mV: the Mi 8's 3100 mV would overdrive the Poco F1's motor. |
 | `xnu/patches-12377/3102-beryllium-audio-board.patch` | Audio DSP and codec clock. Adds the second amp reset pin: the Mi 8's reset pin (gpio76) is the TAS2560's here, and the TAS2559 uses gpio12. |
 | `xnu/patches-12377/3104-beryllium-amps.patch` | The player keeps the amps out of reset, so the tuning program stays loaded. It also checks the TAS2560's fault flags and plays the earpiece through the amps. |
+| `xnu/patches-12377/3105-beryllium-amp-protects.patch` | `kern.sweet_audio_amp_protects`: the Poco F1's amps protect the speakers themselves, so `SweetSpeaker.driver` drops its power limits and its 12 dB make-up and only holds the peaks under -1 dBFS. |
+| `xnu/patches-12377/3106-beryllium-amp-bus-lock.patch` | The bit-banged amp bus gets its own lock. The once-a-second amp check no longer holds the player's lock, which the driver needs on every cycle, so iOS no longer skips ahead (the crackle at full volume). |
+| `xnu/patches-12377/3107-beryllium-amp-wake-lock.patch` | The same for the amp's sleep and wake scripts: the first sound after 5 s of silence no longer loses its start. |
 | `tools/audio/tas2559fw.py` | Makes the I2C scripts for both amps from the phone's firmware and calibration. The scripts hold TI's firmware, so they stay on the phone. |
 | `xnu/patches-12377/0020-stage-bearssl.sh`, `xnu/vendor/sweet_bearssl-7bea48e` | From ferdza's fork. On GitHub Actions the kernel build no longer fails when bearssl.org is down. Other hosts need `GITHUB_WORKSPACE` set to the tree. |
 | `.github/workflows/chlorophyll.yml` | Builds the GPU library on a macOS runner. Adapted from ferdza's fork. |
@@ -110,6 +113,7 @@ Change one level per boot and keep the log of each. `fastboot boot OUT.img` runs
 ## Still to do with the phone
 
 - Volume: tried by ear from DAC gain 1 to Android's 15 with no amp faults; the user picked 12 of 15, now the scripts' default. The 19.2 MHz clock patch (`tools/renegade/timebase_cache.py`) is on the phone: 8 of the 85 cache files change, and a message tone from iOS played with no dropped frames or gaps.
+- Full volume: at full volume Apple's speaker chain (the iPhone 11's) already reaches full scale, so the driver adds no make-up here. A loud tone held its level for 28 s with no skips and no amp faults. Waiting for the user's listen.
 - Earpiece test: DAC gain 7 of 15 is Android's value. Android also uses firmware configuration 13 with the boost always on; the first test uses the loaded configuration 4 without those.
 - Microphone: the Poco F1's path may differ from the Mi 8's.
 - Headphone jack detection.
