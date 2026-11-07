@@ -137,10 +137,10 @@ amp_protects_cases(void)
 	float lowest = guard_take_min_db(&g);
 	printf("  amps protect:    first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, distortion %6.1f dB, lowest gain %.1f dB\n",
 	    first, last, pk, thd, lowest);
-	check(pk <= -1.0f + 0.01f, "amps protect: a peak over -1 dBFS");
+	check(pk <= 0.01f, "amps protect: a peak over 0 dBFS");
 	check(fabsf(last - first) < 0.1f, "amps protect: the level fell during a steady tone");
-	/* +3 dBFS peaks into a -1 dBFS ceiling: 4 dB, plus the high-pass's start-up overshoot */
-	check(lowest > -5.5f, "amps protect: more than the peak excess taken off");
+	/* +3 dBFS peaks into a 0 dBFS ceiling: 3 dB, and no high-pass whose start-up could overshoot */
+	check(lowest > -3.1f, "amps protect: more than the peak excess taken off");
 	check(thd < -60.0f, "amps protect: the limiter distorts a steady tone");
 
 	/* two tones, so the peaks come and go like music's: what is left besides the two tones is the limiter's distortion */
@@ -181,7 +181,7 @@ amp_protects_cases(void)
 		    mode ? "amps protect:" : "Mi 8 guard:", 10 * log10(tot / nt / 0.5), 20 * log10f(tpk), rest_db, guard_take_min_db(&g));
 		if (mode) {
 			check(rest_db < -50.0f, "amps protect: the limiter distorts two tones");
-			check(20 * log10f(tpk) <= -1.0f + 0.01f, "amps protect: a two-tone peak over -1 dBFS");
+			check(20 * log10f(tpk) <= 0.01f, "amps protect: a two-tone peak over 0 dBFS");
 		}
 	}
 
@@ -189,7 +189,7 @@ amp_protects_cases(void)
 	guard_init(&g, RATE, 12.0f);
 	guard_amp_protects(&g);
 	tone_thd(&g, 1000, 0.7f, 0.5f, &first, &last, &pk, &thd);
-	check(pk <= -1.0f + 0.01f, "amps protect: a burst peak over -1 dBFS");
+	check(pk <= 0.01f, "amps protect: a burst peak over 0 dBFS");
 	guard_take_min_db(&g);
 	tone_thd(&g, 1000, powf(10, -32 / 20.0f), 2, &first, &last, &pk, &thd);
 	printf("  quiet tone after it: last second %6.2f dB (want -20.0)\n", last);
@@ -209,20 +209,31 @@ amp_protects_cases(void)
 		cpk = fmaxf(cpk, fabsf(clk[i]));
 	}
 	printf("  click peak %6.2f dBFS\n", 20 * log10f(cpk + 1e-30f));
-	check(20 * log10f(cpk + 1e-30f) <= -1.0f + 0.01f, "amps protect: a click over -1 dBFS");
+	check(20 * log10f(cpk + 1e-30f) <= 0.01f, "amps protect: a click over 0 dBFS");
 
-	/* the Poco F1 as the driver runs it (kProtectsMakeupDB): at full volume Apple's chain sends full scale, its VEQv2
-	 * pre-gain is 0 dB there, so the make-up is 0 dB and the limiter only trims the last dB */
+	/* the Poco F1 as the driver runs it (kProtectsMakeupDB): at full volume Apple's chain sends up to full scale, its
+	 * VEQv2 pre-gain is 0 dB there, so the make-up is 0 dB and the guard leaves the sound alone */
 	printf("full volume on the Poco F1: 1 kHz at 0 dBFS, no make-up, 10 s:\n");
 	guard_init(&g, RATE, 0.0f);
 	guard_amp_protects(&g);
 	tone_thd(&g, 1000, 1.0f, 10, &first, &last, &pk, &thd);
 	lowest = guard_take_min_db(&g);
-	printf("  amps protect:    first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, distortion %6.1f dB, lowest gain %.1f dB\n",
+	printf("  amps protect:    first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, distortion %6.1f dB, lowest gain %.2f dB\n",
 	    first, last, pk, thd, lowest);
-	check(pk <= -1.0f + 0.01f, "no make-up: a peak over -1 dBFS");
-	check(lowest > -2.5f, "no make-up: more than the ceiling's 1 dB and the high-pass's start-up taken off");
-	check(thd < -60.0f, "no make-up: the limiter distorts a full-scale tone");
+	check(pk <= 0.01f, "no make-up: a peak over 0 dBFS");
+	check(lowest > -0.05f, "no make-up: the guard turned a full-scale tone down");
+	check(thd < -60.0f, "no make-up: the guard distorts a full-scale tone");
+	/* bass at full volume (2026-11-07: Safari's music lost up to 3.6 dB on its beats when the high-pass raised the
+	 * peaks into a -1 dBFS ceiling): 150 Hz at -3 dBFS comes out as it went in */
+	printf("  150 Hz at -3 dBFS, no make-up, 10 s: untouched (no high-pass on the Poco)\n");
+	guard_init(&g, RATE, 0.0f);
+	guard_amp_protects(&g);
+	tone_thd(&g, 150, powf(10, -3 / 20.0f), 10, &first, &last, &pk, &thd);
+	lowest = guard_take_min_db(&g);
+	printf("  amps protect:    first second %6.2f dB, last %6.2f dB, peak %6.2f dBFS, lowest gain %.2f dB\n",
+	    first, last, pk, lowest);
+	check(fabsf(last - (-3.0f)) < 0.05f && fabsf(first - (-3.0f)) < 0.05f, "no make-up: 150 Hz did not come out at -3 dB");
+	check(lowest > -0.05f, "no make-up: the guard turned 150 Hz down");
 	printf("  the same tone 12 dB lower (the slider a little under the top): untouched\n");
 	guard_init(&g, RATE, 0.0f);
 	guard_amp_protects(&g);
