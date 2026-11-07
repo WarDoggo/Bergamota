@@ -1,0 +1,87 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: the Poco F1's handset mic on MIC BIAS3, at Android's gain
+
+The capture start powered MIC BIAS1 and set ADC3 to gain 20, the Mi 8's values. The Poco F1's device tree routes
+AMIC3 from MIC BIAS3 (2700 mV), so its handset mic stayed unpowered and iOS recorded silence; with ANA_MICB3 (0x625)
+written by hand the same capture works. Its Android sets "ADC3 Volume" 12 by default (6 to 8 for calls).
+
+cx_amic_switch now powers MIC BIAS3 on the Poco F1 and sets gain 12 there; the switch-off between captures turns
+MIC BIAS3 off again. The Mi 8 keeps MIC BIAS1 and gain 20.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 5379756..b07f5c5 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3774,7 +3774,25 @@ cx_stage_capture(unsigned seconds)
+  * at 2.7 V (DT qcom,cdc-micbias1-mv 2700: (2700 - 1000) / 50 = 0x22) enabled; TX hold of AMIC3 (ANA_AMIC4 bit 6);
+  * ADC3 on with gain 20 (Xiaomi's "ADC3 Volume" 20); ADC MUX7 = AMIC, AMIC MUX7 = ADC3, DMIC MUX7 = ZERO; after
+  * 300 ms the hold released, the HPF re-latched, the decimator unmuted. Then a 2 s capture (stage 7).
++ *
++ * 3109: the Poco F1 is wired differently. Its DT routes AMIC3 <- MIC BIAS3 (qcom,cdc-micbias3-mv 2700), so with MIC
++ * BIAS1 on its handset mic stayed unpowered and iOS recorded silence; and its Android sets "ADC3 Volume" 12
++ * (mixer_paths_overlay_static.xml: the default and the music / interview paths; 6 to 8 for calls). Measured
++ * 2026-11-07 with MIC BIAS3 written by hand: one gain step is about 1.5-2 dB, and a quiet speaker tone came back at
++ * one level, run after run.
+  */
++static uint16_t
++cx_micb(void)                           /* ANA_MICB1 on the Mi 8, ANA_MICB3 on the Poco F1 */
++{
++	return sweet_board_is("xiaomi,dipper") ? 0x0622 : 0x0625;
++}
++
++static uint8_t
++cx_amic_gain(void)                      /* ADC3: Xiaomi's "ADC3 Volume", 20 on the Mi 8, 12 on the Poco F1 */
++{
++	return sweet_board_is("xiaomi,dipper") ? 20 : 12;
++}
++
+ static bool
+ cx_amic_switch(void)
+ {
+@@ -3782,12 +3800,12 @@ cx_amic_switch(void)
+ 		CX_LOG("stage 8 needs stage 6 first\n");
+ 		return false;
+ 	}
+-	CX_LOG("stage 8: decimator 7 from AMIC3 (ADC3, MIC BIAS1)\n");
++	CX_LOG("stage 8: decimator 7 from AMIC3 (ADC3 gain %u, MIC BIAS%u)\n", cx_amic_gain(), cx_micb() == 0x0622 ? 1u : 3u);
+ 	CX_U(0x0aa1, 0x10, 0x10);               /* TX7 muted while it switches */
+ 	CX_U(0x0219, 0x01, 0x00);               /* DMIC2/3 clock off */
+-	CX_U(0x0622, 0xff, 0x40 | 0x22);        /* ANA_MICB1: enable, 2.7 V */
++	CX_U(cx_micb(), 0xff, 0x40 | 0x22);     /* ANA_MICB1 / ANA_MICB3: enable, 2.7 V */
+ 	CX_U(0x0611, 0x40, 0x40);               /* ANA_AMIC4 bit 6: TX hold of AMIC3 */
+-	CX_U(0x0610, 0x9f, 0x80 | 20);          /* ANA_AMIC3: ADC3 on, gain 20 */
++	CX_U(0x0610, 0x9f, 0x80 | cx_amic_gain());     /* ANA_AMIC3: ADC3 on, its gain */
+ 	CX_U(0x0d29, 0x3f, 0x03);               /* ADC_MUX7_CFG0: DMIC MUX7 = ZERO, AMIC MUX7 = ADC3 */
+ 	CX_U(0x0d25, 0x0c, 1 << 2);             /* ADC_MUX3_CFG1: ADC MUX7 = AMIC */
+ 	au_sleep(300);
+@@ -3798,7 +3816,7 @@ cx_amic_switch(void)
+ 	CX_U(0x0aa9, 0x02, 0x00);
+ 	au_sleep(50);
+ 	CX_U(0x0aa1, 0x10, 0x00);               /* unmute */
+-	static const uint16_t am[] = { 0x0622, 0x0610, 0x0611, 0x0d29, 0x0d25, 0x0aa1, 0x0aa2 };
++	const uint16_t am[] = { cx_micb(), 0x0610, 0x0611, 0x0d29, 0x0d25, 0x0aa1, 0x0aa2 };
+ 	cx_dump("analog mic", am, sizeof(am) / sizeof(am[0]));
+ 	cx.amic = true;
+ 	return true;
+@@ -3811,8 +3829,8 @@ cx_stage_amic(void)
+ }
+ 
+ /*
+- * 3066: the analog mic off between captures (cx.busy held by the caller): TX7 muted, ADC3 off (its gain kept), MIC BIAS1
+- * disabled (ANA_MICB1 bits 7:6 = 0). cx.amic false, so the next capture start runs cx_amic_switch again (~350 ms). The
++ * 3066: the analog mic off between captures (cx.busy held by the caller): TX7 muted, ADC3 off (its gain kept), the mic
++ * bias disabled (bits 7:6 = 0 of ANA_MICB1, or ANA_MICB3 on the Poco F1, 3109). cx.amic false, so the next capture start runs cx_amic_switch again (~350 ms). The
+  * rest of the codec, its MCLK vote and the SLIMbus channel stay up.
+  */
+ static bool
+@@ -3821,8 +3839,8 @@ cx_amic_off(void)
+ 	cx.amic = false;                        /* first: even a partial switch-off gets the full switch-on next time */
+ 	CX_U(0x0aa1, 0x10, 0x10);               /* TX7 muted */
+ 	CX_U(0x0610, 0x80, 0x00);               /* ANA_AMIC3: ADC3 off */
+-	CX_U(0x0622, 0xc0, 0x00);               /* ANA_MICB1: MIC BIAS1 off */
+-	static const uint16_t am[] = { 0x0622, 0x0610, 0x0aa1 };
++	CX_U(cx_micb(), 0xc0, 0x00);            /* ANA_MICB1 / ANA_MICB3: the mic bias off */
++	const uint16_t am[] = { cx_micb(), 0x0610, 0x0aa1 };
+ 	cx_dump("analog mic off", am, sizeof(am) / sizeof(am[0]));
+ 	return true;
+ }
