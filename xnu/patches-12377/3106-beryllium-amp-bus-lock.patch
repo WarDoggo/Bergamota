@@ -1,0 +1,180 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: the amp bus off the player's lock
+
+At full volume on the Poco F1 the speaker crackled. SweetSpeaker.driver's log showed the HAL skipping 700 frames
+(15 ms of silence) every few seconds, each time at the moment of the audio thread's once-a-second amp fault check. The
+amp bus is bit-banged at about 1 ms a byte, so that check takes 15-30 ms (two amps on the Poco F1), and it ran with
+au_mtx held. The driver's IO thread takes au_mtx in kern.sweet_audio_play on every cycle, so it waited, missed its
+deadline, and the HAL skipped ahead. A read-only status script from kern.sweet_audio_i2c during playback did the same:
+8192 frames skipped for every script.
+
+The bus gets its own lock, ai_mtx. kern.sweet_audio_i2c takes only ai_mtx, and the audio thread runs the fault check
+after it has let go of au_mtx. The amp scripts (on, off, wake) still run under au_mtx, then ai_mtx. Nothing takes
+au_mtx while holding ai_mtx.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 63bc937..0868d44 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -1650,6 +1650,14 @@ au_boot(void)
+  */
+ static LCK_GRP_DECLARE(au_lck_grp, "sweetaudio");
+ static LCK_MTX_DECLARE(au_mtx, &au_lck_grp);
++/*
++ * 3106: the amp bus. It is bit-banged at about 1 ms a byte, so a fault check takes 15-30 ms and a status script
++ * hundreds. Every bus user takes ai_mtx; the fault check and kern.sweet_audio_i2c no longer take au_mtx, which the
++ * player's sysctl needs on every IO cycle of SweetSpeaker.driver: waiting for the bus there made the driver miss its
++ * deadline and the HAL skip ahead (700 to 12000 frames of silence, a click). Order: au_mtx before ai_mtx; nothing
++ * takes au_mtx while it holds ai_mtx.
++ */
++static LCK_MTX_DECLARE(ai_mtx, &au_lck_grp);
+ static bool au_live;
+ struct au_apr_req {
+ 	uint8_t svc, chan;              /* chan 0 = apr_audio_svc, 1 = apr_apps2 */
+@@ -2075,7 +2083,7 @@ ai_reset_pin(bool high)
+ 	}
+ }
+ 
+-/* one script (ops above), au_mtx held and the bus set up: the error, the ops done in *done, the bytes read at out + *o */
++/* one script (ops above), ai_mtx held and the bus set up: the error, the ops done in *done, the bytes read at out + *o */
+ static int32_t
+ ai_run(const uint8_t *s, size_t n, uint8_t *out, size_t cap, size_t *o, uint32_t *done)
+ {
+@@ -2126,14 +2134,14 @@ au_i2c_sysctl SYSCTL_HANDLER_ARGS
+ 	int err = s && out ? SYSCTL_IN(req, s, n) : ENOMEM;
+ 	uint32_t done = 0;
+ 	int32_t e = 0;
+-	lck_mtx_lock(&au_mtx);
++	lck_mtx_lock(&ai_mtx);                  /* 3106: not au_mtx, the player keeps running */
+ 	if (!err && !ai_setup()) {
+ 		err = EIO;
+ 	}
+ 	if (!err) {
+ 		e = ai_run(s, n, out, cap, &o, &done);
+ 	}
+-	lck_mtx_unlock(&au_mtx);
++	lck_mtx_unlock(&ai_mtx);
+ 	if (!err) {
+ 		memcpy(out, &done, 4);
+ 		memcpy(out + 4, &e, 4);
+@@ -2218,6 +2226,7 @@ static struct {
+ 	uint32_t zeros, gaps, writes, errors, amp_checks;
+ 	uint8_t flags[2];
+ 	bool amp_used;
++	bool check_due;                         /* 3106: au_thread runs the fault check next, without au_mtx */
+ 	bool amp_pending;                       /* an on script arrived while playing without one */
+ 	bool amp_idle, amp_wake;                /* asleep through silence; sound arrived while it sleeps */
+ 	uint64_t last_sound;                    /* mach_absolute_time of the last non-zero sample appended */
+@@ -2322,7 +2331,12 @@ static bool
+ pl_amp(unsigned which, bool reset)
+ {
+ 	static const char *const names[4] = { "off", "on", "wake", "earpiece on" };
+-	if (!pl.amp[which] || !ai_setup()) {
++	if (!pl.amp[which]) {
++		return false;
++	}
++	lck_mtx_lock(&ai_mtx);
++	if (!ai_setup()) {
++		lck_mtx_unlock(&ai_mtx);
+ 		return false;
+ 	}
+ 	uint8_t rd[64];
+@@ -2332,6 +2346,7 @@ pl_amp(unsigned which, bool reset)
+ 	if (!which && reset && sweet_board_is("xiaomi,dipper")) {
+ 		ai_reset_pin(false);
+ 	}
++	lck_mtx_unlock(&ai_mtx);
+ 	char hex[3 * 8 + 1] = "";
+ 	for (size_t i = o > 8 ? o - 8 : 0, h = 0; i < o; i++) {
+ 		h += (size_t)snprintf(hex + h, sizeof(hex) - h, " %02x", rd[i]);
+@@ -2341,19 +2356,24 @@ pl_amp(unsigned which, bool reset)
+ 	return e == 0;
+ }
+ 
+-/* FLAGS_1 (B0P0R104, cleared by the read) and FLAGS_2 (R108); false: unreadable or critical */
++/*
++ * FLAGS_1 (B0P0R104, cleared by the read) and FLAGS_2 (R108) into f; false: unreadable or critical.
++ * 3106: ai_mtx held, au_mtx not (pl_check).
++ */
+ static bool
+-pl_amp_check(void)
++pl_amp_check(uint8_t f2[2])
+ {
+ 	static const uint8_t page0[2] = { 0, 0 }, book0[2] = { 127, 0 };
++	if (!ai_setup()) {
++		return false;
++	}
+ 	int e = ai_write(TAS_ADDR, page0, 2);
+ 	e = e ? e : ai_write(TAS_ADDR, book0, 2);
+ 	e = e ? e : ai_write(TAS_ADDR, page0, 2);
+-	e = e ? e : ai_read(TAS_ADDR, 104, &pl.flags[0], 1);
+-	e = e ? e : ai_read(TAS_ADDR, 108, &pl.flags[1], 1);
+-	pl.amp_checks++;
+-	if (e || (pl.flags[0] & 0xfcu) || (pl.flags[1] & 0x0cu)) {
+-		printf("SWEET AUDIO: player: amp flags %#x %#x (I2C error %d): stopping\n", pl.flags[0], pl.flags[1], e);
++	e = e ? e : ai_read(TAS_ADDR, 104, &f2[0], 1);
++	e = e ? e : ai_read(TAS_ADDR, 108, &f2[1], 1);
++	if (e || (f2[0] & 0xfcu) || (f2[1] & 0x0cu)) {
++		printf("SWEET AUDIO: player: amp flags %#x %#x (I2C error %d): stopping\n", f2[0], f2[1], e);
+ 		return false;
+ 	}
+ 	/* 3104: the Poco F1's TAS2560, when it plays: FLAGS_1 R38 and FLAGS_2 R39, TI's masks 0xfc and 0xc0 */
+@@ -2378,7 +2398,9 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ 	pl.state = PL_OFF;
+ 	bool a = amp ? pl_amp(0, true) : true;
+ 	if (!amp && ai.rst && pl.out == 0 && sweet_board_is("xiaomi,dipper")) {
++		lck_mtx_lock(&ai_mtx);
+ 		ai_reset_pin(false);
++		lck_mtx_unlock(&ai_mtx);
+ 	}
+ 	int st[6] = { -2, -2, -2, -2, -2, -2 };
+ 	if (stream) {
+@@ -2616,12 +2638,32 @@ pl_step(void)
+ 		pl_teardown("drained", pl.amp_used, true, true, true, true);
+ 	} else if (pl.amp_used && !pl.amp_idle && now - pl.last_check >= one_s) {
+ 		pl.last_check = now;
+-		if (!pl_amp_check()) {
+-			pl_teardown("amp fault", pl.amp_used, true, true, true, true);
+-		}
++		pl.check_due = true;
+ 	}
+ }
+ 
++/*
++ * 3106: the once-a-second amp fault check, from au_thread after it let go of au_mtx: only the bus is held while it
++ * runs, so kern.sweet_audio_play answers SweetSpeaker.driver at once. Only au_thread starts, stops or wakes the player
++ * and its amps, so the result belongs to the same player run.
++ */
++static void
++pl_check(void)
++{
++	uint8_t f2[2] = { 0, 0 };
++	lck_mtx_lock(&ai_mtx);
++	bool ok = pl_amp_check(f2);
++	lck_mtx_unlock(&ai_mtx);
++	lck_mtx_lock(&au_mtx);
++	pl.amp_checks++;
++	pl.flags[0] = f2[0];
++	pl.flags[1] = f2[1];
++	if (!ok && pl.state != PL_OFF) {
++		pl_teardown("amp fault", pl.amp_used, true, true, true, true);
++	}
++	lck_mtx_unlock(&au_mtx);
++}
++
+ static int ear_on(void);
+ static int ear_off_idle(void);
+ 
+@@ -4600,7 +4642,12 @@ au_thread(void *arg, wait_result_t w)
+ 			pl_step();
+ 			rec_step();
+ 			bool playing = pl.state != PL_OFF || pl.req || rec.state == REC_RUNNING;
++			bool check = pl.check_due;
++			pl.check_due = false;
+ 			lck_mtx_unlock(&au_mtx);
++			if (check) {
++				pl_check();
++			}
+ 			if (rec.mic_off_pending) {
+ 				rec_mic_off();
+ 			}
