@@ -1,0 +1,42 @@
+From: Poco F1 iOS port
+Subject: [PATCH] rpmh: drop 3119's temporary log line
+
+3119 logged each request it accepted as finished before the first poll, to see the fix work. Three RAM boots on the
+Poco F1 showed it (twice on the audio DSP's cx vote, the DSP up each time, 0 timeouts), so the line goes: it reports a
+handled event, not a problem. The rule itself is unchanged.
+
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index dd45388..1722951 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -340,7 +340,7 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+ 	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
+-	bool done = false, progress = false, settled = false;
++	bool done = false, progress = false;
+ 	unsigned steady = 0;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+@@ -363,20 +363,13 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 		if (steady >= RH_SETTLE_US) {
+ 			/* only if our trigger landed (CONTROL still reads AMC_EN|TRIGGER), so the status is this request's */
+ 			if (rh_read(rh_tcs, b + RH_CONTROL) == (RH_AMC_EN | RH_TRIGGER)) {
+-				done = settled = true;
++				done = true;
+ 				break;
+ 			}
+ 			steady = 0;
+ 		}
+ 		delay(1);
+ 	}
+-	if (settled) {
+-		static unsigned settled_logged;
+-		if (settled_logged++ < 4) {
+-			printf("SWEET RPMH: TCS%u finished before the first poll (idle, cmd-status=%#x, %u us steady): accepted\n",
+-			    t, status[0], RH_SETTLE_US);
+-		}
+-	}
+ 	if (!rh_quiet || !done) {
+ 		printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+ 		    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
