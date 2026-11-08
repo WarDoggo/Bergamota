@@ -1,0 +1,39 @@
+From: Poco F1 iOS port
+Subject: [PATCH] framebuffer: brightness steps are not logged
+
+With the Poco F1's backlight service (3117), CoreBrightness ramps the brightness once per display refresh (5 s fades at
+about 60 Hz), and every step went through blSet(true), which logged a line from the vsync timer: about 60 lines a
+second during each fade, nearly all of the kernel log while the screen changes. blSet now logs only what changes the
+power state (off, on from off) and retries or failures.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 94923d8..cb7fa6f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2983,10 +2983,13 @@ AppleARMBacklight::setProperties(OSObject *properties)
+  * lock). Each write is read back; a mismatch or a failed SPMI access is retried up to 3 times (single reads have come
+  * back 0xffff or 0x0100 while the write had landed). Nothing here turns the backlight path off for good.
+  * 3116: off = brightness 0, then the module off; on = the brightness, then the module on (sweet_wled_module).
++ * 3118: a brightness change while on (CoreBrightness' ramps, one per vsync) is not logged; off, on from off, retries
++ * and failures are.
+  */
+ bool
+ AppleCLCD::blSet(bool on)
+ {
++	bool step = on && fBlPos == SWEET_FB_BL_STEPS;  /* already lit: only the brightness moves */
+ 	if (!on) {
+ 		uint16_t now[SWEET_WLED_STRINGS];
+ 		if (sweet_wled_read16(0, &now[0]) == 0 && sweet_wled_read16(1, &now[1]) == 0 &&
+@@ -3014,8 +3017,10 @@ AppleCLCD::blSet(bool on)
+ 		ok = ok && sweet_wled_module(on, &mod) == 0;
+ 		if (ok) {
+ 			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
+-			IOLog("SWEET FB: backlight %s (0x%04x/0x%04x, MOD_EN 0x%02x)%s\n", on ? "on" : "off", want[0], want[1],
+-			    mod, attempt ? " after a retry" : "");
++			if (!step || attempt) {
++				IOLog("SWEET FB: backlight %s (0x%04x/0x%04x, MOD_EN 0x%02x)%s\n", on ? "on" : "off", want[0], want[1],
++				    mod, attempt ? " after a retry" : "");
++			}
+ 			return true;
+ 		}
+ 		IODelay(200);
