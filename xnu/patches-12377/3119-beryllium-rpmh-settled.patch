@@ -1,0 +1,67 @@
+From: Poco F1 iOS port
+Subject: [PATCH] rpmh: a request that finished before the first poll is done, not a timeout
+
+rh_cmds accepted a completion only after seeing the TCS's IRQ bit (masked for this TCS, so it stays 0) or a busy or
+incomplete state after the trigger, to rule out stale CMD_STATUS. A vote that changes nothing (the CX ARC already at
+the level an earlier vote set, a regulator already on) finishes before the first poll: the TCS reads idle with every
+command ISSUED|COMPLETE from the start, no progress is ever seen, and after 100 ms the request was taken for a
+timeout, the TCS quarantined and RPMh refused for the rest of the boot. On the Poco F1 that is the audio DSP's cx
+vote (no audio for the whole boot; 6 of 41 saved boot logs before, and every boot of the 3117/3118 kernels, where the
+layout moved the first poll) and once Wi-Fi's ldoa17 enable (no Wi-Fi). A request that stays idle and complete,
+unchanged, for 1 ms after the trigger, with CONTROL still reading AMC_EN|TRIGGER (our trigger landed; every saved
+log, good or bad, reads 0x1010000 there), now counts as done (logged, first 4 per boot); a busy TCS or an incomplete
+command still times out as before.
+
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index bbc0d03..dd45388 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -63,6 +63,12 @@ int sweet_rpmh_rfclk_enable(const char *res);
+ #define RH_BCM          5u
+ #define RH_ARC_LEVELS   16u      /* RPMH_ARC_MAX_LEVELS */
+ #define RH_TIMEOUT_US   100000u
++/*
++ * 3119: a request that changes nothing (an ARC already at that level, a regulator already on) can finish before the
++ * first poll, so neither the (masked) IRQ bit nor a busy state is ever seen. Idle with every command complete,
++ * unchanged for this long after the trigger, counts as done; a TCS that was going to run would have gone busy long before.
++ */
++#define RH_SETTLE_US    1000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static bool rh_be;
+@@ -334,7 +340,8 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+ 	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
+-	bool done = false, progress = false;
++	bool done = false, progress = false, settled = false;
++	unsigned steady = 0;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+@@ -351,8 +358,25 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 			done = true;
+ 			break;
+ 		}
++		/* 3119: finished before the first poll (see RH_SETTLE_US) */
++		steady = (!progress && idle == 1u && irq != 0xffffffffu && complete) ? steady + 1 : 0;
++		if (steady >= RH_SETTLE_US) {
++			/* only if our trigger landed (CONTROL still reads AMC_EN|TRIGGER), so the status is this request's */
++			if (rh_read(rh_tcs, b + RH_CONTROL) == (RH_AMC_EN | RH_TRIGGER)) {
++				done = settled = true;
++				break;
++			}
++			steady = 0;
++		}
+ 		delay(1);
+ 	}
++	if (settled) {
++		static unsigned settled_logged;
++		if (settled_logged++ < 4) {
++			printf("SWEET RPMH: TCS%u finished before the first poll (idle, cmd-status=%#x, %u us steady): accepted\n",
++			    t, status[0], RH_SETTLE_US);
++		}
++	}
+ 	if (!rh_quiet || !done) {
+ 		printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+ 		    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
