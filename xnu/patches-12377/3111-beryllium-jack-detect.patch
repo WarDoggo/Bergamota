@@ -1,0 +1,212 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: detect the Poco F1's headphone jack
+
+The Poco F1 has a 3.5 mm jack on the WCD9340 (the Mi 8 has none). A "sweet jack" thread brings the codec up once the
+DSP runs, arms the codec's jack detector (MBHC) the way Linux's wcd_mbhc_initialise does for this board (device tree:
+both switches normally open) and polls its insertion/removal interrupt status twice a second. The plug state comes
+from the switch level (ANA_MBHC_RESULT_3 bit 4), and the detector is armed for the other edge each time. Every 10 s
+it checks that the detector is still on.
+
+kern.sweet_jack (read-only): bit 0 plugged in, bit 1 detector on, bits 8-31 changes since boot. No headphone sound
+yet, and headphones and headsets are not told apart.
+
+Tried by hand on the phone first (sweetreg, 2026-11-08): plugging in and out gave one edge each and the level.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index ae800e7..aca39e0 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -4679,6 +4679,182 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_codec, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_sysctl, "A",
+     "Mi 8 WCD9340 bring-up: 1 QMI, 2 regs, 3 NGD, 4 codec id, 5 init + mic path, 6 SLIMbus channel + AFE, 7 capture 2 s, 8 analog mic + capture, 9 all, 0 off (3062)");
+ 
++/*
++ * 3111: the Poco F1's headphone jack (the Mi 8 has none). The WCD9340's own jack detector (MBHC) watches the jack's
++ * left-channel switch; a plug going in or out raises codec interrupt 8 (MBHC_SW_DET, INTR_PIN1 register 1 bit 0) after
++ * its 96 ms debounce, latched in INTR_PIN1_STATUS1. Its interrupt pin (TLMM 54) is not wired up here: the "sweet jack"
++ * thread brings the codec up once the DSP runs (the chain the first mic use runs, stages 1-5), arms the detector as
++ * Linux's wcd_mbhc_initialise does for this board (device tree: hphl-swh 1 and gnd-swh 1 = both switches normally open)
++ * and reads the status twice a second. On an edge it clears it, takes the plug state from the switch level
++ * (ANA_MBHC_RESULT_3 bit 4 = SWCH_LEVEL_REMOVE: 1 nothing in the jack) and arms the detector for the other edge (MECH
++ * bit 5: 1 = insertion), as mbhc_plug_detect_fn does. Every 10 s it checks the detector is still on (a codec restart
++ * clears it) and the level still matches. Headphones and headsets are not told apart yet (that needs MIC BIAS2 and the
++ * MBHC ADC). Measured by hand on the phone first (2026-11-08): plug in and out each gave one edge and the level.
++ * kern.sweet_jack (anyone, read-only): bit 0 plugged in, bit 1 detector on, bits 8-31 number of changes since boot.
++ */
++#define JK_STATUS1      0x0412u         /* WCD934X_INTR_PIN1_STATUS0 + 1 */
++#define JK_MASK1        0x040au         /* WCD934X_INTR_PIN1_MASK0 + 1 */
++#define JK_CLEAR1       0x041au         /* WCD934X_INTR_PIN1_CLEAR0 + 1 */
++#define JK_LEVEL1       0x0462u         /* WCD934X_INTR_LEVEL0 + 1 */
++#define JK_MECH         0x0614u         /* WCD934X_ANA_MBHC_MECH */
++#define JK_ELECT        0x0615u         /* WCD934X_ANA_MBHC_ELECT */
++#define JK_RESULT3      0x0619u         /* WCD934X_ANA_MBHC_RESULT_3 */
++#define JK_CTL1         0x0720u         /* WCD934X_MBHC_NEW_CTL_1 */
++#define JK_CTL2         0x0721u         /* WCD934X_MBHC_NEW_CTL_2 */
++#define JK_PLUG_CTL     0x0722u         /* WCD934X_MBHC_NEW_PLUG_DETECT_CTL */
++#define JK_SW_DET       0x01u           /* MBHC_SW_DET in register 1 */
++#define JK_REMOVED      0x10u           /* RESULT_3: SWCH_LEVEL_REMOVE */
++#define JK_ARM_INS      0x20u           /* MECH: MECH_DETECTION_TYPE, 1 = waiting for an insertion */
++#define JK_L_DET_EN     0x80u           /* MECH: L_DET_EN */
++static struct {
++	bool armed;
++	bool plugged;
++	uint32_t changes;
++	uint32_t errors;
++} jk;
++
++/* plug state from the switch level, the detector armed for the other edge (cx.busy held) */
++static bool
++jk_follow_level(void)
++{
++	uint8_t r3 = 0;
++	if (cx_reg_rd(JK_RESULT3, &r3)) {
++		return false;
++	}
++	bool in = !(r3 & JK_REMOVED);
++	CX_U(JK_MECH, JK_ARM_INS, in ? 0 : JK_ARM_INS);
++	if (in != jk.plugged) {
++		jk.plugged = in;
++		jk.changes++;
++		printf("SWEET JACK: %s\n", in ? "plugged in" : "unplugged");
++	}
++	return true;
++}
++
++/* Linux's wcd_mbhc_initialise (wcd934x fields, HS_VREF 1.6 V), then the interrupt unmasked (cx.busy held) */
++static bool
++jk_arm(void)
++{
++	CX_U(JK_PLUG_CTL, 0xc0, 2 << 6);        /* HS_L_DET pull-up 2 uA */
++	CX_U(JK_MECH, 0x10, 0x10);              /* HPHL switch normally open */
++	CX_U(JK_MECH, 0x08, 0x08);              /* ground switch normally open */
++	CX_U(JK_MECH, 0x01, 0x01);              /* HPHL 100k to ground */
++	CX_U(JK_MECH, 0x04, 0x04);              /* pull-up comparator */
++	CX_U(JK_MECH, JK_ARM_INS, JK_ARM_INS);
++	CX_U(JK_MECH, JK_L_DET_EN, JK_L_DET_EN);
++	CX_U(JK_PLUG_CTL, 0x0f, 6);             /* insertion/removal debounce 96 ms */
++	CX_U(JK_CTL1, 0x03, 2);                 /* button debounce 16 ms */
++	CX_U(JK_ELECT, 0x01, 0x01);             /* MBHC bias */
++	CX_U(JK_CTL1, 0x80, 0x80);              /* MBHC clock: RCO */
++	CX_U(JK_CTL2, 0x03, 1);                 /* HS_VREF */
++	CX_U(JK_LEVEL1, JK_SW_DET, 0);          /* SW_DET on an edge */
++	CX_U(JK_MASK1, JK_SW_DET, 0);           /* unmasked, as Linux requests it */
++	au_sleep(200);                          /* past the debounce: a plug already in has raised its edge */
++	CX_W(JK_CLEAR1, JK_SW_DET);
++	jk.plugged = false;
++	if (!jk_follow_level()) {
++		return false;
++	}
++	printf("SWEET JACK: detector on, %s\n", jk.plugged ? "plugged in" : "nothing plugged in");
++	return true;
++}
++
++static void
++jk_err(const char *what)
++{
++	if (jk.errors++ < 5) {
++		printf("SWEET JACK: %s failed (%u)\n", what, jk.errors);
++	}
++}
++
++/* one look at the detector (cx.busy held) */
++static void
++jk_poll(bool full)
++{
++	uint8_t st = 0, mech = 0;
++	if (cx_reg_rd(JK_STATUS1, &st)) {
++		jk_err("status read");
++		return;
++	}
++	if (st & JK_SW_DET) {
++		if (cx_reg_wr(JK_CLEAR1, JK_SW_DET) || !jk_follow_level()) {
++			jk_err("plug change");
++		}
++		return;
++	}
++	if (!full) {
++		return;
++	}
++	if (cx_reg_rd(JK_MECH, &mech)) {
++		jk_err("detector read");
++	} else if (!(mech & JK_L_DET_EN)) {
++		printf("SWEET JACK: detector found off, armed again\n");
++		jk.armed = false;
++	} else if (!jk_follow_level()) {
++		jk_err("level check");
++	}
++}
++
++static void
++jk_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	unsigned waited = 0, tries = 0, tick = 0;
++	if (sweet_board_is("xiaomi,dipper")) {  /* the Mi 8 has no jack */
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	while (!au_live && waited < 1200) {     /* the DSP comes up about 150 s into a boot */
++		au_sleep(1000);
++		waited++;
++	}
++	if (!au_live) {
++		printf("SWEET JACK: no DSP after %u s: no jack detection\n", waited);
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	au_sleep(20000);                        /* after the DSP's own start, not on top of it */
++	for (;;) {
++		bool idle = true;
++		if (!__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++			if (!cx.codec_up) {
++				jk.armed = false;
++				if (tries < 5) {        /* bring it up once; a codec switched off later stays off */
++					tries++;
++					if (cx_codec_chain()) {
++						tries = 5;
++					} else {
++						printf("SWEET JACK: codec start failed (try %u of 5)\n", tries);
++					}
++				}
++			}
++			if (cx.codec_up && !jk.armed) {
++				jk.armed = jk_arm();
++				if (!jk.armed) {
++					jk_err("arming");
++				}
++			}
++			if (jk.armed) {
++				jk_poll(++tick % 20 == 0);
++			}
++			idle = !jk.armed;
++			__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++		}
++		au_sleep(idle ? 30000 : 500);
++	}
++}
++
++static int
++jk_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (jk.plugged ? 1 : 0) | (jk.armed ? 2 : 0) | (int)((jk.changes & 0xffffffu) << 8);
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_jack, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0, jk_sysctl, "I",
++    "Poco F1 headphone jack: bit 0 plugged in, bit 1 detector on, bits 8-31 changes since boot (3111)");
++
+ static void
+ au_thread(void *arg, wait_result_t w)
+ {
+@@ -4740,5 +4916,10 @@ dipper_audio_init(void)
+ 		thread_set_thread_name(th, "sweet audio");
+ 		thread_deallocate(th);
+ 	}
++	/* 3111: the jack thread when the DSP is part of the boot (it ends at once on the Mi 8, which has no jack) */
++	if (stage >= 3 && kernel_thread_start(jk_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_set_thread_name(th, "sweet jack");
++		thread_deallocate(th);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
