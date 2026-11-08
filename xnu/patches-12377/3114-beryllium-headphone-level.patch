@@ -1,0 +1,29 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: the Poco F1's headphones at Android's level
+
+The headphones' default digital gain goes from -20 dB to -1 dB, the level of Xiaomi's headphones overlay (HPH PA index
+7, RX1/RX2 digital 83). At -20 dB, iOS at full volume was only just loud enough on 62-ohm studio headphones (AKG K612
+Pro). kern.sweet_hph_gain still sets both gains at run time.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 54f9100..78ffdee 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -4164,7 +4164,7 @@ ear_off_idle(void)
+  * them. Gains: kern.sweet_hph_gain = (HPH PA index << 8) | (uint8_t)RX1/RX2 digital dB (-84 = mute .. 0); the PA index
+  * is HPH_L_EN/HPH_R_EN bits 4:0 with the gain taken from the register (bit 5, compander off), 0 the loudest; Android's
+  * "HPHL Volume" control is 24 minus it, and Xiaomi's headphones overlay uses 17 (index 7) with digital 83 (-1 dB).
+- * Default index 7 and -20 dB. kern.sweet_audio_out=2 brings the path up for the next player start; 0 or 1 take it down
++ * Default index 7 and -1 dB. kern.sweet_audio_out=2 brings the path up for the next player start; 0 or 1 take it down
+  * again when the player is not on it.
+  */
+ #define HP_PORT_L       16u             /* codec RX port of RX0 (WCD934X_RX_START + 0) */
+@@ -4172,7 +4172,7 @@ ear_off_idle(void)
+ #define HP_CHAN_L       144u            /* shared channels 144 + RX index, as the machine driver's rx_ch */
+ #define HP_CHAN_R       145u
+ static uint8_t cx_hph_pa = 7;
+-static int8_t cx_hph_db = -20;
++static int8_t cx_hph_db = -1;
+ 
+ /* cx.busy within ms milliseconds (the jack thread holds it for a few register reads twice a second) */
+ static bool
