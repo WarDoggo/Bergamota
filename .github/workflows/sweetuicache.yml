@@ -17,6 +17,7 @@ on:
       - tools/sweetnet/sweetrec.c
       - tools/sweetnet/sweetcx.c
       - tools/sweetnet/sweetreg.c
+      - tools/sweetnet/sweetreboot.c
       - tools/audio/SweetSpeaker/**
 
 jobs:
@@ -61,7 +62,7 @@ jobs:
           python3 -I $P --sign out/sweetlog
           # the audio test tools; sweetrec, sweetcx and sweetreg: the handset mic and the WCD9340 codec (kern.sweet_audio_rec,
           # kern.sweet_codec, kern.sweet_codec_reg), so the phone can measure its own speaker
-          for T in sweeti2c sweetplay sweetapr sweetpool sweetrec sweetcx sweetreg; do
+          for T in sweeti2c sweetplay sweetapr sweetpool sweetrec sweetcx sweetreg sweetreboot; do
             xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall tools/sweetnet/$T.c -o out/$T
             codesign -s - -f --entitlements tools/sweetnet/entitlements.plist out/$T
             python3 -I $P --sign out/$T
