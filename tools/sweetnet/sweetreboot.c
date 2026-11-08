@@ -1,5 +1,9 @@
 /*
  * sweetreboot fastboot|recovery|bergamota|normal: reboot the Poco F1 into that mode.
+ * sweetreboot poweroff: turn it off (kernel patch 3115). It sets the sysctl mode
+ * poweroff, which kernels without 3115 refuse (then nothing else is called: on
+ * them a halt keeps the phone on with a black screen), and calls reboot(RB_HALT),
+ * the same call as iOS's "slide to power off".
  *
  * Sets the root-only sysctl kern.sweet_reboot_mode (kernel patch 0137), syncs
  * and calls the reboot(2) syscall (RB_AUTOBOOT), which reaches the kernel's
@@ -19,6 +23,7 @@
 #include <unistd.h>
 
 #define RB_AUTOBOOT_VALUE 0
+#define RB_HALT_VALUE 0x08	/* <sys/reboot.h> RB_HALT */
 
 int
 main(int argc, char **argv)
@@ -41,9 +46,11 @@ main(int argc, char **argv)
 		mode = "bergamota";	/* kernel patch 0140: IMEM 'BERG', shim enters Bergamota fastboot */
 	} else if (want && !strcmp(want, "normal")) {
 		mode = "normal";
+	} else if (want && !strcmp(want, "poweroff")) {
+		mode = "poweroff";	/* kernel patch 3115 */
 	}
 	if (!mode) {
-		fprintf(stderr, "usage: sweetreboot [-n] fastboot|recovery|bergamota|normal\n");
+		fprintf(stderr, "usage: sweetreboot [-n] fastboot|recovery|bergamota|normal|poweroff\n");
 		return 2;
 	}
 	if (geteuid() != 0) {
@@ -51,7 +58,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 	if (sysctlbyname("kern.sweet_reboot_mode", NULL, NULL, (void *)mode, strlen(mode) + 1) != 0) {
-		perror("sweetreboot: sysctl kern.sweet_reboot_mode (kernel without patch 0137, or 0140 for bergamota?)");
+		perror("sweetreboot: sysctl kern.sweet_reboot_mode (kernel without patch 0137, 0140 for bergamota, 3115 for poweroff?)");
 		return 1;
 	}
 	char got[32] = "";
@@ -73,7 +80,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "sweetreboot: reboot not found\n");
 		return 1;
 	}
-	reboot_fn(RB_AUTOBOOT_VALUE);
+	reboot_fn(strcmp(mode, "poweroff") ? RB_AUTOBOOT_VALUE : RB_HALT_VALUE);
 	perror("sweetreboot: reboot");
 	return 1;
 }
