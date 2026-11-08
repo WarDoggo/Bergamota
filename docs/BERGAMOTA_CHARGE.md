@@ -17,13 +17,15 @@ power-on reason, so a warm reboot from iOS would be misdetected. Normal boots: o
 - Keys (PM8998 PON INT_RT_STS 0x810, SID 0, polled every 40 ms, two equal samples): bit0 KPDPWR (Power), bit1 RESIN (Volume Down), as in the kernel's SWEET KEYS.
   Power short = blank/wake toggle; Power hold 2 s = leave charging mode, the normal flow in `enxerto_main` continues (iOS payload, or Bergamota fastboot if none).
   Volume Down = `usb_power_up()` + `bergamota_fastboot()` (USB is only started now; if fastboot cannot start/ends, the charging screen returns with a red notice). While the screen is dark, any key only wakes it.
-- Idle 20 s: WLED brightness ramps to 0 (quadratic, 5 steps) and the value found is restored on wake. If WLED cannot be read/written/read back (APID not EE0-owned, MOD_EN off) the panel is blanked with black pixels and the UI is redrawn on wake. If WLED is enabled but at 0 when we start, it is lit at 0x7ff.
+- Idle 20 s: WLED brightness ramps to 0 (quadratic, 5 steps), then the WLED module is switched off (MOD_EN 0xd846 = 0;
+  brightness 0 alone left the screen very dim, seen on hardware 2026-11-08); wake restores the brightness found, then
+  switches the module on. If WLED cannot be read/written/read back (APID not EE0-owned, MOD_EN off) the panel is blanked with black pixels and the UI is redrawn on wake. If WLED is enabled but at 0 when we start, it is lit at 0x7ff.
 - If the arbiter lookup fails: screen shows `--%` / "Battery info unavailable", keys are then unreadable too: the screen stays on with the notice "hold Power 10 s to restart".
 
 ## PMIC access (port of xnu/patches 0062/0092/0095/0126/0137)
 Arbiter v5 core 0x0c440000 (ver check 0x5..0x6, APID count), owner cfg 0x0c40a000, EE0 observer 0x0e600000 (read: CMD (1<<27)|(addr&0xff)<<4, STATUS +8, RDATA +0x18), write channel 0x0c600000+0x10000*APID.
 Reads (allow-listed peripherals): SID2 PMI8998 FG MSOC 0x4009 (rescaled as the kernel), VBAT 0x41a0 (x122070/1e6 mV), IBAT 0x41a2 (488.281 uA/bit, + = discharging), SCHG USBIN plug RT 0x1310 bit4, charger state 0x1006[2:0] (1-4 charging, 5 terminate), APSD 0x1308; SID0 PON 0x808/0x810.
-The ONLY writes: SID3 WLED brightness 0xd957/0xd967 and sink SYNC 0xd947 (same whitelist as the kernel backlight fade), refused unless EE0 owns the APID, read back after writing, originals restored on mismatch. No SCHG/FG/PON write exists in the code.
+The ONLY writes: SID3 WLED brightness 0xd957/0xd967, sink SYNC 0xd947 and MOD_EN 0xd846 (same whitelist as the kernel backlight, 3116), refused unless EE0 owns the APID, read back after writing, originals restored on mismatch. No SCHG/FG/PON write exists in the code.
 
 ## Test
 `BOARD=beryllium enxerto/build.sh` builds `enxerto/out/charge-test.img` (empty ramdisk, cmdline `console=null bergamota.charge=1`) next to `enxerto-boot.img`. Run through the Bergamota queue (`fastboot boot enxerto/out/charge-test.img`)
