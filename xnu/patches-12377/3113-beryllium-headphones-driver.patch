@@ -1,0 +1,179 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: the Poco F1's headphones for SweetSpeaker.driver
+
+kern.sweet_audio_play gets two ops for the driver's headphone device, as START_EAR and EAR_OFF are for the earpiece:
+START_HPH (8) brings the headphone path up when needed (EAGAIN while another codec step runs) and starts the player on
+it; HPH_OFF (9) takes the path down unless the player plays on it (EBUSY then). EAR_OFF no longer moves the player's
+output away from the headphones.
+
+3112's HPH interrupt bits are corrected: in INTR_PIN1_STATUS0 the HPHL/HPHR over-current faults are bits 2 and 3 and
+the PA ramps done bits 5 and 6 (bits 0 and 1 are the SLIMbus and misc interrupts); those four are unmasked, read,
+cleared and masked again.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 33d6d10..54f9100 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2201,7 +2201,10 @@ enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4,
+        /* 3067j, for SweetSpeaker.driver (audiomxd is not root): START on the speaker / on the earpiece (its path comes up
+         * first if needed: stages 1-5 + 10, EAGAIN while another codec step runs), the earpiece path off unless the player
+         * plays on it (stage 11, EBUSY then) */
+-       PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6, PL_OP_EAR_OFF = 7 };
++       PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6, PL_OP_EAR_OFF = 7,
++       /* 3113: START on the Poco F1's headphones (their path comes up first if needed, EAGAIN while another codec step
++        * runs), their path off unless the player plays on it (EBUSY then) */
++       PL_OP_START_HPH = 8, PL_OP_HPH_OFF = 9 };
+ _Static_assert(PL_ZEROS + PL_PERIOD <= AU_POOL_SIZE, "the ring and its zeros fit the window");
+ 
+ struct pl_status {
+@@ -2697,6 +2700,8 @@ pl_job(uint8_t job)
+ 
+ static int ear_on(void);
+ static int ear_off_idle(void);
++static int hph_on(void);
++static int hph_off_idle(void);
+ 
+ static int
+ au_play_sysctl SYSCTL_HANDLER_ARGS
+@@ -2752,12 +2757,17 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 				pl.state = PL_DRAINING;
+ 			}
+ 			lck_mtx_unlock(&au_mtx);
+-		} else if (op == PL_OP_START || op == PL_OP_STOP || op == PL_OP_START_SPEAKER || op == PL_OP_START_EAR) {
++		} else if (op == PL_OP_START || op == PL_OP_STOP || op == PL_OP_START_SPEAKER || op == PL_OP_START_EAR ||
++		    op == PL_OP_START_HPH) {
+ 			if (op == PL_OP_START_EAR && (err = ear_on())) {
+ 				return err;
+ 			}
+-			if (op == PL_OP_START_SPEAKER || op == PL_OP_START_EAR) {
+-				au_out = op == PL_OP_START_EAR;  /* the player's next start; a running player keeps its output (EBUSY) */
++			if (op == PL_OP_START_HPH && (err = hph_on())) {
++				return err;
++			}
++			if (op == PL_OP_START_SPEAKER || op == PL_OP_START_EAR || op == PL_OP_START_HPH) {
++				/* the player's next start; a running player keeps its output (EBUSY) */
++				au_out = op == PL_OP_START_HPH ? 2u : op == PL_OP_START_EAR ? 1u : 0u;
+ 			}
+ 			uint32_t rq = op == PL_OP_STOP ? PL_OP_STOP : PL_OP_START;
+ 			lck_mtx_lock(&au_mtx);
+@@ -2771,6 +2781,8 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 			err = w >= 10000 ? ETIMEDOUT : rq == PL_OP_START ? (int)pl.result : 0;
+ 		} else if (op == PL_OP_EAR_OFF) {
+ 			err = ear_off_idle();
++		} else if (op == PL_OP_HPH_OFF) {
++			err = hph_off_idle();
+ 		} else {
+ 			err = EINVAL;
+ 		}
+@@ -4119,7 +4131,9 @@ ear_off_idle(void)
+ 		return EBUSY;
+ 	}
+ 	if (!sweet_board_is("xiaomi,dipper")) {
+-		au_out = 0;
++		if (au_out == 1) {                     /* 3113: not when the headphones have the output */
++			au_out = 0;
++		}
+ 		return 0;
+ 	}
+ 	if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
+@@ -4220,7 +4234,7 @@ cx_stage_hph(void)
+ 	CX_U(0x0c03, 0x03, 0x00);               /* CDC_CLSH_DECAY_CTRL */
+ 	CX_U(0x0c0a, 0x0f, 0x00);               /* CDC_CLSH_K2_MSB */
+ 	CX_W(0x0c0b, 0x60);                     /* CDC_CLSH_K2_LSB */
+-	CX_U(0x0409, 0x0f, 0x00);               /* INTR_PIN1_MASK0: HPH OCP faults and ramps unmasked (the pin is not wired) */
++	CX_U(0x0409, 0x6c, 0x00);               /* INTR_PIN1_MASK0: HPHL/R OCP faults (bits 2, 3), PA ramps (5, 6); pin not wired */
+ 	/* the path: INP0 = RX0 / RX1, DEM = CLSH_DSM_OUT with its look-ahead delay */
+ 	CX_U(0x0d03, 0x0f, 0x05);               /* CDC_RX_INP_MUX_RX_INT1_CFG0: INP0 = RX0 */
+ 	CX_U(0x0d05, 0x0f, 0x06);               /* CDC_RX_INP_MUX_RX_INT2_CFG0: INP0 = RX1 */
+@@ -4337,9 +4351,9 @@ cx_stage_hph(void)
+ 	(void)cx_if_rd((uint16_t)(0x80 + HP_PORT_R), &pl_r);
+ 	(void)cx_reg_rd(0x0411, &irq);          /* INTR_PIN1_STATUS0 */
+ 	CX_LOG("codec RX ports: interrupt status %02x %02x, port %u status %02x, port %u status %02x; HPH interrupts %02x "
+-	    "(bits 0-1 OCP faults, 2-3 PA ramps done)\n", s0, s1, HP_PORT_L, pl_l, HP_PORT_R, pl_r, irq);
+-	if (irq & 0x0f) {
+-		(void)cx_reg_wr(0x0419, irq & 0x0f);    /* INTR_PIN1_CLEAR0 */
++	    "(bits 2-3 OCP faults, 5-6 PA ramps done)\n", s0, s1, HP_PORT_L, pl_l, HP_PORT_R, pl_r, irq);
++	if (irq & 0x6c) {
++		(void)cx_reg_wr(0x0419, irq & 0x6c);    /* INTR_PIN1_CLEAR0 */
+ 	}
+ 	static const uint16_t hph[] = { 0x0d03, 0x0d05, 0x0b55, 0x0b56, 0x0b59, 0x0b5d, 0x0b69, 0x0b6a, 0x0b6d, 0x0b71, 0x0606,
+ 		                        0x0608, 0x0609, 0x06b6, 0x06ce, 0x06d1, 0x06d3, 0x06d6, 0x0c01 };
+@@ -4411,7 +4425,7 @@ cx_stage_hph_off(void)
+ 	CX_U(0x0b69, 0x40, 0x40);
+ 	CX_U(0x0b69, 0x40, 0x00);
+ 	CX_U(0x0b69, 0x0f, 0x04);
+-	CX_U(0x0409, 0x0f, 0x0f);               /* HPH interrupts masked again */
++	CX_U(0x0409, 0x6c, 0x6c);               /* HPH interrupts masked again */
+ 	CX_W(0x0606, 0x03);                     /* ANA_BUCK_CTL off */
+ 	CX_W(0x0606, 0x00);
+ 	CX_U(0x0608, 0x01, 0x00);               /* RX bias off */
+@@ -4424,6 +4438,69 @@ cx_stage_hph_off(void)
+ 	return true;
+ }
+ 
++/*
++ * 3113: the headphone path for kern.sweet_audio_play's START_HPH / HPH_OFF (SweetSpeaker.driver's headphone device,
++ * shown while headphones are plugged in): up through the codec chain if needed (cx_take: the jack thread holds cx.busy
++ * for a few register reads twice a second), and down again unless the player plays on it.
++ */
++static int
++hph_on(void)
++{
++	if (!sweet_board_beryllium()) {
++		return ENODEV;
++	}
++	if (cx.hph_up) {
++		return 0;
++	}
++	if (!cx_take(1000)) {
++		return EAGAIN;
++	}
++	int r = 0;
++	if (!cx.hph_up) {
++		cx.off = 0;
++		cx.log[0] = 0;
++		cx.runs++;
++		CX_LOG("run %u: headphones on (player)\n", cx.runs);
++		r = cx_codec_chain() && cx_stage_hph() ? 0 : EIO;
++	}
++	__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++	sweet_log_sync();
++	return r;
++}
++
++static int
++hph_off_idle(void)
++{
++	lck_mtx_lock(&au_mtx);
++	bool on_hph = (pl.state != PL_OFF && pl.out == 2) || pl.req;
++	lck_mtx_unlock(&au_mtx);
++	if (on_hph) {
++		return EBUSY;
++	}
++	if (!cx.hph_up) {
++		if (au_out == 2) {
++			au_out = 0;
++		}
++		return 0;
++	}
++	if (!cx_take(1000)) {
++		return EAGAIN;
++	}
++	if (cx.hph_up) {
++		cx.off = 0;
++		cx.log[0] = 0;
++		cx.runs++;
++		CX_LOG("run %u: headphones off (player)\n", cx.runs);
++		(void)cx_stage_hph_off();
++	}
++	if (au_out == 2) {
++		au_out = 0;
++	}
++	__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++	sweet_log_sync();
++	return 0;
++}
++
+ /* kern.sweet_hph_gain: (HPH PA index << 8) | (uint8_t)RX1/RX2 digital dB, applied at once when the headphones are up */
+ static int
+ hph_gain_sysctl SYSCTL_HANDLER_ARGS
