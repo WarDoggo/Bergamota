@@ -1,0 +1,509 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: play on the Poco F1's headphones (kernel side)
+
+The Poco F1's 3.5 mm jack hangs on the WCD9340's HPHL/HPHR outputs. A new codec path brings them up the way Xiaomi's
+own kernel drives them for headphones with the compander off (class-H CLS_H_LOHIFI, the Tavil 1.1 register values),
+in the order the Mi 8's earpiece path found to work: the path clocked and muted, class-H and the DACs up, then the two
+SLIMbus channels (144, 145 into codec RX ports 16 and 17), then the PAs and unmute, the DSP's SLIMBUS_0_RX port last.
+The off path runs it backwards.
+
+kern.sweet_audio_out=2 brings the path up and makes the kernel player's next start play stereo on SLIMBUS_0_RX; 0 or 1
+take it down again when the player is not on it. kern.sweet_hph_gain sets (HPH PA index << 8) | digital dB (default
+index 7 and -20 dB; Xiaomi's headphones setting is index 7 and -1 dB). No iOS device for the headphones yet.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index aca39e0..33d6d10 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -1036,7 +1036,7 @@ static struct {
+ 	vm_offset_t slim, rst;
+ 	uint8_t tid, la, la_if;
+ 	int page, if_page;
+-	bool codec_up, mic_up, port_up, amic, ear_up;
++	bool codec_up, mic_up, port_up, amic, ear_up, hph_up;
+ 	uint32_t runs;
+ 	bool busy, powered, regs_ok, ngd_up;
+ 	char log[4096];
+@@ -2236,23 +2236,32 @@ static struct {
+ 	uint32_t sleeps, wakes;
+ 	uint8_t *amp[4];                        /* [0] off, [1] on, [2] wake, [3] earpiece on (Poco F1, 3104) */
+ 	uint32_t amp_len[4];
+-	uint32_t out;                           /* 3067: where this run plays: 0 the speaker, 1 the earpiece */
++	uint32_t out;                           /* 3067: where this run plays: 0 the speaker, 1 the earpiece, 2 the headphones */
+ } pl;
+ 
+ /*
+  * 3067: where the next player start plays (kern.sweet_audio_out): 0 the speaker (QUAT_MI2S_RX -> TAS2557), 1 the
+  * earpiece (SLIMBUS_0_RX -> WCD9340 RX0 -> RX INT0 -> EAR PA; the codec side is brought up by the sysctl, stage 10).
++ * 3112: 2 the Poco F1's headphones (SLIMBUS_0_RX, two channels -> RX0/RX1 -> RX INT1/INT2 -> HPHL/HPHR PAs).
+  */
+ static uint32_t au_out;
+ 
+ /*
+  * 3104: the Mi 8's earpiece hangs on the WCD9340 (SLIMBUS_0_RX). The Poco F1's is the TAS2559's output, so there the
+- * earpiece plays through QUAT_MI2S_RX like the loudspeaker, with amp script [3] and the TAS2560 left off.
++ * earpiece plays through QUAT_MI2S_RX like the loudspeaker, with amp script [3] and the TAS2560 left off. 3112: the
++ * Poco F1's headphones hang on the WCD9340 too (SLIMBUS_0_RX, stereo).
+  */
+ static bool
+ pl_slim(void)
+ {
+-	return pl.out && sweet_board_is("xiaomi,dipper");
++	return pl.out == 2 || (pl.out == 1 && sweet_board_is("xiaomi,dipper"));
++}
++
++/* 3112: the Mi 8's earpiece, the one codec output with a single channel */
++static bool
++pl_mono(void)
++{
++	return pl.out == 1 && pl_slim();
+ }
+ 
+ static uint16_t
+@@ -2449,8 +2458,9 @@ pl_start(void)
+ 	pl.amp_idle = pl.amp_wake = false;
+ 	pl.sleeps = pl.wakes = 0;
+ 	pl.out = au_out;
+-	if (pl_slim() && !cx.ear_up) {
+-		printf("SWEET AUDIO: player: the earpiece path is not up (kern.sweet_audio_out=1 brings it up)\n");
++	if (pl_slim() && !(pl.out == 2 ? cx.hph_up : cx.ear_up)) {
++		printf("SWEET AUDIO: player: the %s path is not up (kern.sweet_audio_out=%u brings it up)\n",
++		    pl.out == 2 ? "headphone" : "earpiece", pl.out);
+ 		return ENXIO;
+ 	}
+ 	int st = sweet_smmu_map_sid(AU_SID);
+@@ -2511,8 +2521,8 @@ pl_start(void)
+ 	}
+ 	stream = true;
+ 	/*
+-	 * ADM_CMD_DEVICE_OPEN_V5: RX, endpoint the port, NULL_COPP_TOPOLOGY, 16 bit 48 kHz, the speaker 2 ch FL FR, the
+-	 * earpiece 1 ch FL (the stream's left channel) -> {status, COPP}
++	 * ADM_CMD_DEVICE_OPEN_V5: RX, endpoint the port, NULL_COPP_TOPOLOGY, 16 bit 48 kHz, the speaker and the headphones
++	 * 2 ch FL FR, the Mi 8's earpiece 1 ch FL (the stream's left channel) -> {status, COPP}
+ 	 */
+ 	struct {
+ 		uint16_t flags, mode, ep1, ep2;
+@@ -2520,9 +2530,9 @@ pl_start(void)
+ 		uint16_t channels, bits;
+ 		uint32_t rate;
+ 		uint8_t map[8];
+-	} __attribute__((packed)) a = { 0, 1, pl_port(), 0xffff, ADM_NULL_COPP_TOPOLOGY, (uint16_t)(pl_slim() ? 1 : 2), 16, AU_RATE,
++	} __attribute__((packed)) a = { 0, 1, pl_port(), 0xffff, ADM_NULL_COPP_TOPOLOGY, (uint16_t)(pl_mono() ? 1 : 2), 16, AU_RATE,
+ 		                        { 1, 2 } };
+-	if (pl_slim()) {
++	if (pl_mono()) {
+ 		a.map[1] = 0;
+ 	}
+ 	step = "COPP open";
+@@ -2568,7 +2578,7 @@ pl_start(void)
+ 	pl.last_done = pl.last_check = pl.last_sound = mach_absolute_time();
+ 	pl_submit();
+ 	printf("SWEET AUDIO: player on (%s): mem map handle %#x, COPP %u, amp %s, %u writes of %u bytes queued, ring %u bytes\n",
+-	    pl.out ? "earpiece" : "speaker", pl.handle, pl.copp, pl_slim() ? "not used" : pl.amp_used ? "on" : "not scripted (silent)",
++	    pl.out == 2 ? "headphones" : pl.out ? "earpiece" : "speaker", pl.handle, pl.copp, pl_slim() ? "not used" : pl.amp_used ? "on" : "not scripted (silent)",
+ 	    pl.qn, PL_PERIOD, PL_RING);
+ 	return 0;
+ fail:
+@@ -3197,7 +3207,7 @@ cx_stage_codec(void)
+ 	}
+ 	CX_LOG("codec PGD logical address %#x\n", cx.la);
+ 	cx.la_if = 0xff;
+-	cx.codec_up = cx.mic_up = cx.port_up = cx.ear_up = cx.amic = false;
++	cx.codec_up = cx.mic_up = cx.port_up = cx.ear_up = cx.hph_up = cx.amic = false;
+ 	uint16_t off = 0x800 + 0x21, ec = (uint16_t)(3 | 0x8 | ((off & 0xf) << 4) | ((off & 0xff0) << 4));   /* 4 bytes */
+ 	uint8_t rq[6] = { 6 | (0 << 5), 0x60, cx.la, 0, (uint8_t)ec, (uint8_t)(ec >> 8) };            /* REQUEST_VALUE */
+ 	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
+@@ -4128,6 +4138,323 @@ ear_off_idle(void)
+ 	return 0;
+ }
+ 
++/*
++ * 3112: the Poco F1's headphones (the Mi 8 has no jack): the WCD9340's HPHL and HPHR outputs, compander off, as Xiaomi's
++ * own kernel drives them (techpack/audio wcd934x.c and wcd9xxx-common-v2.c; Tavil 1.1, this chip: id 01 00 08 01) and
++ * in the order the earpiece's stage 10 found to work: the path clocked and muted, class-H and the DACs up, then the
++ * channels, then the PAs and unmute, the DSP's port last. Two shared channels on SLIMBUS_0_RX, 144 and 145 (FL, FR),
++ * into codec RX ports 16 and 17 (RX0, RX1; one multi-channel group, as Linux's wcd934x_slim_set_hw_params makes it),
++ * RX INT1 INP0 = RX0 (HPHL) and RX INT2 INP0 = RX1 (HPHR), DEM = CLSH_DSM_OUT, class-H in Tavil's CLS_H_LOHIFI (the
++ * driver's default and Android's hph-highquality-mode; the main path, as Android's headphones-44.1 uses it). The
++ * manager gets both channels in one DEF_ACT_CHAN and one REMOVE, as qcom_slim_ngd_enable_stream / _disable_stream send
++ * them. Gains: kern.sweet_hph_gain = (HPH PA index << 8) | (uint8_t)RX1/RX2 digital dB (-84 = mute .. 0); the PA index
++ * is HPH_L_EN/HPH_R_EN bits 4:0 with the gain taken from the register (bit 5, compander off), 0 the loudest; Android's
++ * "HPHL Volume" control is 24 minus it, and Xiaomi's headphones overlay uses 17 (index 7) with digital 83 (-1 dB).
++ * Default index 7 and -20 dB. kern.sweet_audio_out=2 brings the path up for the next player start; 0 or 1 take it down
++ * again when the player is not on it.
++ */
++#define HP_PORT_L       16u             /* codec RX port of RX0 (WCD934X_RX_START + 0) */
++#define HP_PORT_R       17u             /* RX1 */
++#define HP_CHAN_L       144u            /* shared channels 144 + RX index, as the machine driver's rx_ch */
++#define HP_CHAN_R       145u
++static uint8_t cx_hph_pa = 7;
++static int8_t cx_hph_db = -20;
++
++/* cx.busy within ms milliseconds (the jack thread holds it for a few register reads twice a second) */
++static bool
++cx_take(unsigned ms)
++{
++	for (unsigned w = 0;; w += 10) {
++		if (!__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++			return true;
++		}
++		if (w >= ms) {
++			return false;
++		}
++		au_sleep(10);
++	}
++}
++
++/* both outputs' gains: the PA's from the register, the digital volume once the interpolators are clocked */
++static bool
++cx_hph_gains(void)
++{
++	CX_U(0x06d3, 0x3f, (uint8_t)(0x20 | cx_hph_pa));       /* HPH_L_EN: register gain, index */
++	CX_U(0x06d6, 0x3f, (uint8_t)(0x20 | cx_hph_pa));       /* HPH_R_EN */
++	CX_W(0x0b59, (uint8_t)cx_hph_db);                      /* CDC_RX1_RX_VOL_CTL */
++	CX_W(0x0b6d, (uint8_t)cx_hph_db);                      /* CDC_RX2_RX_VOL_CTL */
++	return true;
++}
++
++/* the headphones on (thread context, cx.busy held, codec up through stage 5) */
++static bool
++cx_stage_hph(void)
++{
++	int r, r2;
++	if (!cx.mic_up) {
++		CX_LOG("headphones: the codec is not up (stage 5 first)\n");
++		return false;
++	}
++	if (cx.hph_up) {
++		return true;
++	}
++	CX_LOG("headphones on: codec RX0/RX1 (ports %u/%u, channels %u/%u) -> HPHL/HPHR, class-H LOHIFI, AFE SLIMBUS_0_RX "
++	    "last\n", HP_PORT_L, HP_PORT_R, HP_CHAN_L, HP_CHAN_R);
++	if (cx.la_if == 0xff) {
++		cx.la_if = cx_addr(cx_ifd_ea);
++		if (cx.la_if == 0xff) {
++			CX_LOG("the codec's interface device has no logical address\n");
++			return false;
++		}
++	}
++	(void)cx_afe_slave_cfg();
++	/* Xiaomi's register defaults for the HPH outputs (tavil_codec_reg_defaults, the Tavil 1.1 init) */
++	CX_U(0x06b6, 0x0f, 0x02);               /* RX_OCP_CTL: two attempts */
++	CX_W(0x06ce, 0x3a);                     /* HPH_OCP_CTL: current limit, OCP FSM on */
++	CX_U(0x06d4, 0x01, 0x01);               /* HPH_L_TEST: OCP detection */
++	CX_U(0x06d7, 0x01, 0x01);               /* HPH_R_TEST */
++	CX_W(0x0733, 0x84);                     /* HPH_NEW_INT_RDAC_HD2_CTL_L */
++	CX_W(0x0736, 0x84);                     /* HPH_NEW_INT_RDAC_HD2_CTL_R */
++	CX_U(0x0b67, 0x01, 0x01);               /* CDC_RX1_RX_PATH_DSMDEM_CTL */
++	CX_U(0x0b7b, 0x01, 0x01);               /* CDC_RX2_RX_PATH_DSMDEM_CTL */
++	CX_U(0x0c03, 0x03, 0x00);               /* CDC_CLSH_DECAY_CTRL */
++	CX_U(0x0c0a, 0x0f, 0x00);               /* CDC_CLSH_K2_MSB */
++	CX_W(0x0c0b, 0x60);                     /* CDC_CLSH_K2_LSB */
++	CX_U(0x0409, 0x0f, 0x00);               /* INTR_PIN1_MASK0: HPH OCP faults and ramps unmasked (the pin is not wired) */
++	/* the path: INP0 = RX0 / RX1, DEM = CLSH_DSM_OUT with its look-ahead delay */
++	CX_U(0x0d03, 0x0f, 0x05);               /* CDC_RX_INP_MUX_RX_INT1_CFG0: INP0 = RX0 */
++	CX_U(0x0d05, 0x0f, 0x06);               /* CDC_RX_INP_MUX_RX_INT2_CFG0: INP0 = RX1 */
++	CX_U(0x0b5d, 0x03, 0x01);               /* CDC_RX1_RX_PATH_SEC0: DEM = CLSH_DSM_OUT */
++	CX_U(0x0b71, 0x03, 0x01);               /* CDC_RX2_RX_PATH_SEC0 */
++	CX_U(0x0b56, 0x08, 0x08);               /* CDC_RX1_RX_PATH_CFG0: look-ahead delay */
++	CX_U(0x0b6a, 0x08, 0x08);               /* CDC_RX2_RX_PATH_CFG0 */
++	/* stream start as for the earpiece (bias, RCO and MCLK are already up for the mic) */
++	CX_W(0x0606, 0x02);                     /* ANA_BUCK_CTL */
++	CX_W(0x0606, 0x03);
++	CX_W(0x0606, 0x07);
++	CX_U(0x0608, 0x01, 0x01);               /* ANA_RX_SUPPLIES: RX bias */
++	/* the interpolators clocked, muted (tavil_codec_enable_interp_clk; no HD2 on Tavil 1.1) */
++	CX_U(0x0b55, 0x1f, 0x14);               /* CDC_RX1_RX_PATH_CTL: 48 kHz, PGA muted */
++	CX_U(0x0b55, 0x20, 0x20);               /* clock */
++	CX_U(0x0c0f, 0x01, 0x00);               /* CDC_CLSH_TEST0: HPHL delay */
++	CX_U(0x0d8b, 0x80, 0x80);               /* CDC_TOP_HPHL_COMP_LUT: bypass */
++	CX_U(0x0b69, 0x1f, 0x14);               /* CDC_RX2_RX_PATH_CTL */
++	CX_U(0x0b69, 0x20, 0x20);
++	CX_U(0x0c0f, 0x02, 0x00);               /* HPHR delay */
++	CX_U(0x0d90, 0x80, 0x80);               /* CDC_TOP_HPHR_COMP_LUT */
++	if (!cx_hph_gains()) {
++		return false;
++	}
++	/* the DACs: class-H for HPHL (wcd_clsh_state_hph_l, CLS_H_LOHIFI), then HPHR joins it (wcd_clsh_state_hph_st) */
++	CX_U(0x071e, 0x01, 0x01);               /* SIDO_NEW_VOUT_D_FREQ2: ripple frequency control */
++	CX_U(0x073a, 0x02, 0x00);               /* HPH_NEW_INT_HPH_TIMER1: autochop timer off */
++	CX_U(0x0c01, 0x01, 0x01);               /* CDC_CLSH_CRC: clock */
++	CX_U(0x0c08, 0x0f, 0x00);               /* CDC_CLSH_K1_MSB (16 ohm) */
++	CX_W(0x0c09, 0xc0);                     /* CDC_CLSH_K1_LSB */
++	CX_U(0x0b56, 0x40, 0x40);               /* RX1 class-H */
++	CX_U(0x0608, 0x02, 0x00);               /* ANA_RX_SUPPLIES: regulator class-H */
++	CX_U(0x0608, 0x04, 0x04);               /* VNEG power level HiFi */
++	CX_U(0x06a8, 0xf0, 0x80);               /* FLYBACK_VNEG_CTRL_4 */
++	CX_U(0x0738, 0x20, 0x20);               /* HPH_NEW_INT_PA_MISC2 */
++	CX_U(0x06bf, 0xf0, 0xc0);               /* RX_BIAS_HPH_LOWPOWER */
++	CX_U(0x06d1, 0x0e, 0x02);               /* HPH_PA_CTL1 */
++	CX_U(0x0608, 0x40, 0x40);               /* flyback (VNEG) on */
++	au_sleep(1);
++	CX_U(0x0608, 0x08, 0x08);               /* VPOS power level HiFi */
++	CX_U(0x0608, 0x80, 0x80);               /* buck (VPOS) on */
++	au_sleep(1);
++	CX_U(0x0609, 0x0c, 0x04);               /* ANA_HPH: power level (Tavil's LOHIFI) */
++	CX_U(0x0b6a, 0x40, 0x40);               /* RX2 class-H */
++	CX_U(0x0609, 0x30, 0x30);               /* ANA_HPH: HPHL and HPHR DACs */
++	au_sleep(1);
++	/* the interface ports, then both channels through the manager */
++	cx.if_page = -1;
++	if (cx_if_wr(0x030, 0x03) ||                                   /* RX port interrupt enable: RX0, RX1 */
++	    cx_if_wr((uint16_t)(0x140 + 4 * HP_PORT_L), 0x03) ||       /* RX_PORT_MULTI_CHNL_0: the group RX0 + RX1 */
++	    cx_if_wr((uint16_t)(0x140 + 4 * HP_PORT_R), 0x03) ||
++	    cx_if_wr((uint16_t)(0x30 + HP_PORT_L), (2u << 1) | 1u) ||  /* RX_PORT_CFG: water mark, enable */
++	    cx_if_wr((uint16_t)(0x30 + HP_PORT_R), (2u << 1) | 1u)) {
++		CX_LOG("interface RX port registers not written\n");
++		return false;
++	}
++	uint8_t cl[4] = { cx.la, HP_PORT_L, HP_CHAN_L, 0 }, cr[4] = { cx.la, HP_PORT_R, HP_CHAN_R, 0 };
++	r = cx_mgr_acked(0x2d, cl, sizeof(cl), 3);     /* SLIM_USR_MC_CONNECT_SINK: la, port, channel, tid */
++	r2 = r ? -1 : cx_mgr_acked(0x2d, cr, sizeof(cr), 3);
++	CX_LOG("CONNECT_SINK -> %d, %d\n", r, r2);
++	if (r || r2) {
++		return false;
++	}
++	uint8_t def[7] = { (uint8_t)(cx.la & 0x1f), (16 >> 2) | (1 << 5), (uint8_t)((2 << 4) | cx_rx_prot), cx_rx_prate, 0,
++		           HP_CHAN_L, HP_CHAN_R };
++	r = cx_mgr_acked(0x21, def, sizeof(def), 4);   /* SLIM_USR_MC_DEF_ACT_CHAN: both channels */
++	CX_LOG("DEF_ACT_CHAN (2 channels) -> %d\n", r);
++	if (r) {
++		return false;
++	}
++	uint8_t rec[2] = { 0, cx.la };
++	r = cx_mgr_acked(0x24, rec, sizeof(rec), 0);   /* SLIM_USR_MC_RECONFIG_NOW */
++	CX_LOG("RECONFIG_NOW -> %d\n", r);
++	if (r) {
++		return false;
++	}
++	/* the PAs (tavil_codec_enable_hphl_pa / _hphr_pa): OCP off, both on, 20 ms (no compander), OCP back, unmute */
++	CX_U(0x06b6, 0x0f, 0x0f);               /* RX_OCP_CTL */
++	CX_U(0x06ce, 0x10, 0x00);               /* HPH_OCP_CTL: OCP FSM off */
++	CX_U(0x0609, 0xc0, 0xc0);               /* ANA_HPH: HPHL and HPHR PAs */
++	au_sleep(20);
++	CX_U(0x06d4, 0x01, 0x01);               /* OCP detection */
++	CX_U(0x06d7, 0x01, 0x01);
++	CX_U(0x0b55, 0x10, 0x00);               /* RX1 PGA unmuted */
++	CX_U(0x0b69, 0x10, 0x00);               /* RX2 */
++	CX_U(0x06cc, 0x80, 0x80);               /* HPH_CNP_WG_CTL: GM3 boost */
++	CX_U(0x073a, 0x02, 0x02);               /* autochop timer on */
++	CX_U(0x0b5a, 0x10, 0x00);               /* CDC_RX1_RX_PATH_MIX_CTL: mix path mute off, as tavil does */
++	CX_U(0x0b6e, 0x10, 0x00);               /* CDC_RX2_RX_PATH_MIX_CTL */
++	CX_U(0x06ce, 0x10, 0x10);               /* OCP FSM on */
++	CX_U(0x06b6, 0x0f, 0x02);
++	/* the DSP last */
++	struct {
++		uint32_t minor;
++		uint16_t dev, bits, fmt, chans;
++		uint8_t map[8];
++		uint32_t rate;
++	} __attribute__((packed)) sb = { 1, 0, 16, 0, 2, { HP_CHAN_L, HP_CHAN_R }, AU_RATE };
++	lck_mtx_lock(&au_mtx);
++	r = afe_port_param(AFE_PORT_SLIMBUS_0_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &sb,
++	    sizeof(sb));
++	int st = r ? -1 : afe_port_cmd(AFE_PORT_SLIMBUS_0_RX, AFE_PORT_CMD_DEVICE_START);
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("AFE SLIMBUS_0_RX (2 channels) config -> %d, start -> %d\n", r, st);
++	if (r || st) {
++		return false;
++	}
++	cx.hph_up = true;
++	au_sleep(50);
++	uint8_t s0 = 0, s1 = 0, pl_l = 0, pl_r = 0, irq = 0;
++	(void)cx_if_rd(0x34, &s0);              /* PORT_INT_STATUS_RX_0 */
++	(void)cx_if_rd(0x35, &s1);
++	(void)cx_if_rd((uint16_t)(0x80 + HP_PORT_L), &pl_l);
++	(void)cx_if_rd((uint16_t)(0x80 + HP_PORT_R), &pl_r);
++	(void)cx_reg_rd(0x0411, &irq);          /* INTR_PIN1_STATUS0 */
++	CX_LOG("codec RX ports: interrupt status %02x %02x, port %u status %02x, port %u status %02x; HPH interrupts %02x "
++	    "(bits 0-1 OCP faults, 2-3 PA ramps done)\n", s0, s1, HP_PORT_L, pl_l, HP_PORT_R, pl_r, irq);
++	if (irq & 0x0f) {
++		(void)cx_reg_wr(0x0419, irq & 0x0f);    /* INTR_PIN1_CLEAR0 */
++	}
++	static const uint16_t hph[] = { 0x0d03, 0x0d05, 0x0b55, 0x0b56, 0x0b59, 0x0b5d, 0x0b69, 0x0b6a, 0x0b6d, 0x0b71, 0x0606,
++		                        0x0608, 0x0609, 0x06b6, 0x06ce, 0x06d1, 0x06d3, 0x06d6, 0x0c01 };
++	cx_dump("headphones (expected 0606 07, 0608 cd, 0609 f4, 0b55 24, 0b69 24)", hph, sizeof(hph) / sizeof(hph[0]));
++	return true;
++}
++
++/*
++ * the headphones off: the channels first as for the earpiece (DISCONNECT_PORT, interface interrupt clear, one REMOVE,
++ * RECONFIG_NOW), the PAs (mute, OCP off, PAs off, 20 ms), the DACs and class-H in wcd_clsh_state_hph_st / _hph_r's order,
++ * the interpolator clocks off with a reset pulse, ANA_BUCK_CTL and the RX bias off, the DSP's port last. Bias, RCO and
++ * MCLK stay for the mic.
++ */
++static bool
++cx_stage_hph_off(void)
++{
++	int r, r2;
++	CX_LOG("headphones off\n");
++	cx.hph_up = false;
++	uint8_t dl[3] = { cx.la, HP_PORT_L, 0 }, dr[3] = { cx.la, HP_PORT_R, 0 };
++	r = cx_mgr_acked(0x2e, dl, sizeof(dl), 2);     /* SLIM_USR_MC_DISCONNECT_PORT: la, port, tid */
++	r2 = cx_mgr_acked(0x2e, dr, sizeof(dr), 2);
++	CX_LOG("DISCONNECT_PORT -> %d, %d\n", r, r2);
++	cx.if_page = -1;
++	(void)cx_if_wr(0x038, 0x03);            /* RX port interrupt clear: RX0, RX1 */
++	uint8_t rm[4] = { (uint8_t)(0x80 | (cx.la & 0x1f)), 0, HP_CHAN_L, HP_CHAN_R };
++	r = cx_mgr_acked(0x23, rm, sizeof(rm), 1);     /* SLIM_USR_MC_CHAN_CTRL remove: 0x80 | la, tid, channels */
++	CX_LOG("REMOVE_CHAN (2 channels) -> %d\n", r);
++	uint8_t rec[2] = { 0, cx.la };
++	r = cx_mgr_acked(0x24, rec, sizeof(rec), 0);
++	CX_LOG("RECONFIG_NOW -> %d\n", r);
++	CX_U(0x06b6, 0x0f, 0x0f);               /* OCP off */
++	CX_U(0x06ce, 0x10, 0x00);
++	CX_U(0x06d4, 0x01, 0x00);
++	CX_U(0x06d7, 0x01, 0x00);
++	CX_U(0x0b55, 0x10, 0x10);               /* RX1, RX2 PGA muted */
++	CX_U(0x0b69, 0x10, 0x10);
++	CX_U(0x0b5a, 0x10, 0x10);               /* mix paths muted */
++	CX_U(0x0b6e, 0x10, 0x10);
++	CX_U(0x0609, 0xc0, 0x00);               /* PAs off */
++	au_sleep(20);
++	CX_U(0x06ce, 0x10, 0x10);               /* OCP FSM on again */
++	CX_U(0x06b6, 0x0f, 0x02);
++	CX_U(0x0609, 0x30, 0x00);               /* DACs off */
++	au_sleep(1);
++	CX_U(0x0b56, 0x40, 0x00);               /* RX1 class-H off (HPHR alone left) */
++	CX_U(0x0609, 0x0c, 0x00);               /* power level normal */
++	CX_U(0x0b6a, 0x40, 0x00);               /* RX2 class-H off */
++	CX_U(0x0c01, 0x01, 0x00);               /* CDC_CLSH_CRC */
++	CX_U(0x0608, 0x80, 0x00);               /* buck off */
++	au_sleep(1);
++	CX_U(0x0608, 0x40, 0x00);               /* flyback off */
++	au_sleep(1);
++	CX_U(0x0738, 0x20, 0x00);               /* force_iq_ctl, gm3_boost_disable: back to normal */
++	CX_U(0x06bf, 0xf0, 0x80);
++	CX_U(0x06d1, 0x0e, 0x06);
++	CX_U(0x06cc, 0x80, 0x80);
++	CX_U(0x06a8, 0xf0, 0x70);
++	CX_U(0x0608, 0x0e, 0x00);               /* flyback and buck modes, regulator: default */
++	CX_U(0x071e, 0x01, 0x00);               /* ripple frequency control off */
++	CX_U(0x0c0f, 0x03, 0x03);               /* HPHL/HPHR delay back */
++	CX_U(0x0d8b, 0x80, 0x00);               /* LUT bypass off */
++	CX_U(0x0d90, 0x80, 0x00);
++	CX_U(0x0b55, 0x20, 0x00);               /* interpolator clocks off, reset pulse, 48 kHz */
++	CX_U(0x0b55, 0x40, 0x40);
++	CX_U(0x0b55, 0x40, 0x00);
++	CX_U(0x0b55, 0x0f, 0x04);
++	CX_U(0x0b69, 0x20, 0x00);
++	CX_U(0x0b69, 0x40, 0x40);
++	CX_U(0x0b69, 0x40, 0x00);
++	CX_U(0x0b69, 0x0f, 0x04);
++	CX_U(0x0409, 0x0f, 0x0f);               /* HPH interrupts masked again */
++	CX_W(0x0606, 0x03);                     /* ANA_BUCK_CTL off */
++	CX_W(0x0606, 0x00);
++	CX_U(0x0608, 0x01, 0x00);               /* RX bias off */
++	lck_mtx_lock(&au_mtx);
++	int st = afe_port_cmd(AFE_PORT_SLIMBUS_0_RX, AFE_PORT_CMD_DEVICE_STOP);
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("AFE SLIMBUS_0_RX stop -> %d\n", st);
++	static const uint16_t hph[] = { 0x0b55, 0x0b56, 0x0b69, 0x0b6a, 0x0606, 0x0608, 0x0609, 0x0c01 };
++	cx_dump("headphones off", hph, sizeof(hph) / sizeof(hph[0]));
++	return true;
++}
++
++/* kern.sweet_hph_gain: (HPH PA index << 8) | (uint8_t)RX1/RX2 digital dB, applied at once when the headphones are up */
++static int
++hph_gain_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (cx_hph_pa << 8) | (uint8_t)cx_hph_db, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	int8_t db = (int8_t)(v & 0xff);
++	unsigned pa = ((unsigned)v >> 8) & 0xffu;
++	if (((unsigned)v >> 16) || pa > 24 || db < -84 || db > 0) {
++		return EINVAL;
++	}
++	cx_hph_db = db;
++	cx_hph_pa = (uint8_t)pa;
++	if (cx.hph_up) {
++		if (!cx_take(1000)) {
++			return EBUSY;
++		}
++		bool ok = !cx.hph_up || cx_hph_gains();
++		__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++		if (!ok) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_hph_gain, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, hph_gain_sysctl, "I",
++    "Poco F1 headphone gains: (HPH PA index, 0 loudest .. 24) << 8 | RX1/RX2 digital dB, -84 mute .. 0 (3112)");
++
+ /*
+  * 3067c, for ordering experiments on the earpiece's SLIMbus link (the codec's RX0 port reports overflow continuously):
+  * stage 12 stops AFE SLIMBUS_0_RX, stage 13 configures and starts it, stage 14 redoes the manager's side
+@@ -4245,7 +4572,11 @@ ear_chan_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ear_chan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ear_chan_sysctl, "I",
+     "Mi 8 earpiece channel: (protocol << 8) | presence byte (0x83 = 48 kHz frequency locked), before the path is up (3067g)");
+ 
+-/* kern.sweet_audio_out: 0 the speaker, 1 the earpiece (brings its path up); the player's next start uses it */
++/*
++ * kern.sweet_audio_out: 0 the speaker, 1 the earpiece (on the Mi 8 brings its codec path up), 2 the Poco F1's headphones
++ * (3112: brings their path up; 0 or 1 take it down again unless the player is playing on it); the player's next start
++ * uses it
++ */
+ static int
+ au_out_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -4254,21 +4585,37 @@ au_out_sysctl SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (v != 0 && v != 1) {
++	if (v != 0 && v != 1 && !(v == 2 && sweet_board_beryllium())) {
+ 		return EINVAL;
+ 	}
+-	if (v == 1 && !cx.ear_up && sweet_board_is("xiaomi,dipper")) {
++	bool ear_up = v == 1 && !cx.ear_up && sweet_board_is("xiaomi,dipper");
++	bool hph_up = v == 2 && !cx.hph_up, hph_down = v != 2 && cx.hph_up;
++	if (hph_down) {
++		lck_mtx_lock(&au_mtx);
++		bool playing = (pl.state != PL_OFF && pl.out == 2) || pl.req;
++		lck_mtx_unlock(&au_mtx);
++		if (playing) {
++			return EBUSY;
++		}
++	}
++	if (ear_up || hph_up || hph_down) {
+ 		if (!au_live) {
+ 			return ENXIO;
+ 		}
+-		if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++		if (!cx_take(1000)) {
+ 			return EBUSY;
+ 		}
+ 		cx.off = 0;
+ 		cx.log[0] = 0;
+ 		cx.runs++;
+-		CX_LOG("run %u: earpiece on\n", cx.runs);
+-		bool ok = cx_codec_chain() && cx_stage_ear();
++		bool ok;
++		if (hph_down) {
++			CX_LOG("run %u: headphones off\n", cx.runs);
++			ok = cx_stage_hph_off();
++		} else {
++			CX_LOG("run %u: %s on\n", cx.runs, hph_up ? "headphones" : "earpiece");
++			ok = cx_codec_chain() && (hph_up ? cx_stage_hph() : cx_stage_ear());
++		}
+ 		__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
+ 		sweet_log_sync();
+ 		if (!ok) {
+@@ -4276,11 +4623,11 @@ au_out_sysctl SYSCTL_HANDLER_ARGS
+ 		}
+ 	}
+ 	au_out = (uint32_t)v;
+-	printf("SWEET AUDIO: output %s from the next player start\n", v ? "earpiece" : "speaker");
++	printf("SWEET AUDIO: output %s from the next player start\n", v == 2 ? "headphones" : v ? "earpiece" : "speaker");
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_out, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_out_sysctl, "I",
+-    "Mi 8 player output: 0 speaker, 1 earpiece (WCD9340 EAR; brings the path up) (3067)");
++    "player output: 0 speaker, 1 earpiece (Mi 8: WCD9340 EAR, brings the path up), 2 Poco F1 headphones (3067, 3112)");
+ 
+ /*
+  * kern.sweet_audio_amp_protects (3105), read-only: 1 where the amps protect the speakers themselves, so
