@@ -170,6 +170,8 @@ static void blank(void)
 			uint16_t z[2] = { 0, 0 };
 			if (pmic_wled_set(z))
 				have_wled = 0;
+			else
+				(void)pmic_wled_module(0);	/* really dark: brightness 0 alone still glows */
 		}
 		if (!have_wled) {
 			/* put back what we found before falling back to black pixels */
@@ -190,8 +192,14 @@ static void wake(void)
 		pixel_blank = 0;
 		charge_ui_update(&view);
 		draw_diag();
-	} else if (have_wled && pmic_wled_set(wled_on)) {
-		have_wled = 0;
+	} else if (have_wled) {
+		/* the brightness first, then the module (qcom-wled.c order); without the module there is no light, so retried */
+		int bad = pmic_wled_set(wled_on);
+
+		for (unsigned i = 0; i < 3 && pmic_wled_module(1); i++)
+			delay_ms(5);
+		if (bad)
+			have_wled = 0;
 	}
 	screen_on = 1;
 }
