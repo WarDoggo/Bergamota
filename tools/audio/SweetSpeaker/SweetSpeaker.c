@@ -49,7 +49,10 @@
  * USB-C headphones (VirtualAudio's Device_USB_Aspen). It shares the kernel player with "Speaker" and "Receiver" like
  * those two (the output whose IO started last owns it), started with START_HPH (xnu 3113: the codec's HPHL/HPHR path
  * comes up first if needed, 3112); its IO end and an unplug take the path down (HPH_OFF). Stereo, its own volume and
- * mute, no speaker guard; the kernel's kern.sweet_hph_gain sets the codec's own gains.
+ * mute, no speaker guard; the kernel's kern.sweet_hph_gain sets the codec's own gains. VirtualAudio's USB class gives
+ * up on a device without a USB location ID ('lcID', a CFNumber; observed: "CAException ... 'who?'" right after
+ * DeviceFactory's "Unhandled UID", the HAL forwarding only the custom properties a device lists in 'cust'), so the
+ * headphone device lists and answers one (kHpLocationID).
  *
  * Logs to the unified log, subsystem com.sweet.SweetSpeaker (`sweetlog 60 SweetSpeaker`).
  */
@@ -100,6 +103,13 @@ enum {
 #define kHpModelUID             "SweetHeadphones"
 #define kHpTestSwitch           "/private/var/tmp/sweethp.on"   /* exists: the headphone device is shown, plugged or not */
 #define kHpPollUs               500000u         /* the jack poll: kern.sweet_jack twice a second */
+#define kHpLocationID           0x14100000      /* the headphone device's USB location ID (any number; VirtualAudio needs one) */
+enum {
+	kSel_CustomInfo = 'cust',               /* kAudioObjectPropertyCustomPropertyInfoList */
+	kSel_LocationID = 'lcID',               /* the USB location ID VirtualAudio's Device_USB_Aspen reads first */
+	kCustType_None = 0,
+	kCustType_PList = 'plst',               /* kAudioServerPlugInCustomPropertyDataTypeCFPropertyList */
+};
 #define kMicRing                65536u          /* samples of the local capture ring (1.4 s), a power of 2 */
 #define kMicDelay               2880u           /* 60 ms: 2 of the kernel's 20 ms pieces + the reader's 5 ms polls + margin */
 #define kMicSafetyOffset        480u
@@ -616,6 +626,9 @@ has_property(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, cons
 		switch (inAddress->mSelector) {
 		case kAudioDevicePropertyPreferredChannelsForStereo:
 			return inObjectID == kObjectID_Device || inObjectID == kObjectID_Hp;
+		case kSel_CustomInfo:
+		case kSel_LocationID:
+			return inObjectID == kObjectID_Hp;
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
 		case kAudioObjectPropertyOwner:
@@ -876,6 +889,19 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			    inObjectID == kObjectID_Actuator ? CFSTR(kActuatorModelUID) : CFSTR(kDeviceModelUID));
 		case kAudioDevicePropertyTransportType:
 			OUT(UInt32, hp ? kAudioDeviceTransportTypeUSB : kAudioDeviceTransportTypeBuiltIn);
+		case kSel_CustomInfo: {                 /* the headphone device only (has_property) */
+			UInt32 info[3] = { kSel_LocationID, kCustType_PList, kCustType_None };
+			if (inDataSize < sizeof(info)) {
+				return kAudioHardwareBadPropertySizeError;
+			}
+			memcpy(outData, info, sizeof(info));
+			*outDataSize = sizeof(info);
+			return kAudioHardwareNoError;
+		}
+		case kSel_LocationID: {                 /* a new CFNumber each time: the caller releases it */
+			SInt32 loc = kHpLocationID;
+			OUT(CFNumberRef, CFNumberCreate(NULL, kCFNumberSInt32Type, &loc));
+		}
 		case kAudioDevicePropertyRelatedDevices:
 			return out_ids(&inObjectID, 1, inDataSize, outDataSize, outData);
 		case kAudioDevicePropertyClockDomain:
@@ -1121,9 +1147,10 @@ SS_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, AudioObjectID inObje
 	UInt32 size = 0;
 	OSStatus r = SS_GetPropertyData(inDriver, inObjectID, inClientProcessID, inAddress, inQualifierDataSize,
 	    inQualifierData, sizeof(scratch), &size, &scratch);
-	if (r == kAudioHardwareNoError && inObjectID == kObjectID_MicSource && inAddress &&
-	    inAddress->mSelector == kAudioSelectorControlPropertyItemName) {
-		CFStringRef made;
+	if (r == kAudioHardwareNoError && inAddress && ((inObjectID == kObjectID_MicSource &&
+	    inAddress->mSelector == kAudioSelectorControlPropertyItemName) ||
+	    (inObjectID == kObjectID_Hp && inAddress->mSelector == kSel_LocationID))) {
+		CFTypeRef made;
 		memcpy(&made, scratch.bytes, sizeof(made));
 		if (made) {
 			CFRelease(made);                        /* the size query made a name nobody takes */
