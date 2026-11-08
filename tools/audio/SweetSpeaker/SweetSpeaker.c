@@ -330,12 +330,6 @@ is_receiver(AudioObjectID o)
 }
 
 static bool
-is_hp(AudioObjectID o)
-{
-	return o == kObjectID_Hp || o == kObjectID_HpStream || o == kObjectID_HpVolume || o == kObjectID_HpMute;
-}
-
-static bool
 is_device(AudioObjectID o)
 {
 	return o == kObjectID_Device || o == kObjectID_Actuator || o == kObjectID_Mic || o == kObjectID_Receiver ||
@@ -729,46 +723,12 @@ has_property(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, cons
 	return false;
 }
 
-/*
- * TEMPORARY, for the headphone device's bring-up (remove once iOS takes it): each property iOS asks of the headphone
- * objects that they do not have, logged once, to see what VirtualAudio's USB device class looks for.
- */
-static pthread_mutex_t gHpAskMutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void
-hp_asked(AudioObjectID o, const AudioObjectPropertyAddress *a)
-{
-	static struct {
-		AudioObjectID o;
-		AudioObjectPropertySelector s;
-	} seen[64];
-	static unsigned n;
-	pthread_mutex_lock(&gHpAskMutex);
-	bool known = false;
-	for (unsigned i = 0; i < n && !known; i++) {
-		known = seen[i].o == o && seen[i].s == a->mSelector;
-	}
-	if (!known && n < 64) {
-		seen[n].o = o;
-		seen[n].s = a->mSelector;
-		n++;
-		UInt32 s = a->mSelector, c = a->mScope;
-		os_log(gLog, "SweetSpeaker: headphones: object %u has no '%c%c%c%c' (scope '%c%c%c%c', element %u)", o, (char)(s >> 24),
-		    (char)(s >> 16), (char)(s >> 8), (char)s, (char)(c >> 24), (char)(c >> 16), (char)(c >> 8), (char)c, a->mElement);
-	}
-	pthread_mutex_unlock(&gHpAskMutex);
-}
-
 static Boolean
 SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID,
     const AudioObjectPropertyAddress *inAddress)
 {
 	(void)inClientProcessID;
-	Boolean r = has_property(inDriver, inObjectID, inAddress);
-	if (!r && inAddress && is_hp(inObjectID)) {
-		hp_asked(inObjectID, inAddress);
-	}
-	return r;
+	return has_property(inDriver, inObjectID, inAddress);
 }
 
 static OSStatus
