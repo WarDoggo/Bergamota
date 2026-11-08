@@ -1,0 +1,130 @@
+From: Poco F1 iOS port
+Subject: [PATCH] framebuffer: backlight service on the Poco F1, with its panel data
+
+Without an AppleARMBacklight service CoreBrightness has no display to drive, and SpringBoard starts with the display
+"Off" (cbDisplayMode:Off, backlight factor 0): the Poco F1 came up asleep after every boot, and the idle timer could
+not wake it ("only prox can use _undimFromSource when the screen is off"). The service was left off on the Poco F1
+since 0246/0249 (the 1 frame/s of the iOS 18 CPU renderer, then backboardd's crash without panel data). 3018 gave the
+Mi 8 its panel data; the Poco F1 now gets its own: EBBG FT8716 / Tianma NT36672A LCD, peak 420 nits from
+qcom,mdss-dsi-panel-peak-brightness (4200000), PMI8998 WLED 20 mA full scale per string (qcom,fs-curr-ua), mid 7 mA =
+147 nits, minimum 2, marketing table 2 + 418 * x^2.2 (33 points). The service is published when the WLED is armed;
+sweetfb_blsvc=0 turns it off. brightness-nits maps onto the WLED with that 420 nits peak (the default was 500).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 712742f..94923d8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -267,12 +267,24 @@ class IOMobileFramebufferUserClient;
+  * at 0 (-[CBDisplayModuleiOS initWithBacklight:queue:display:]), the "crash" that kept sweetfb_blsvc off since 0249.
+  * Values are IOFixed (16.16). The panel's peak is its dtsi's (qcom,mdss-dsi-panel-peak-brightness); the minimum is its
+  * bl-min-level's; currents only have to be consistent with the nits (OLED: nothing measures them).
++ * 3117: the Poco F1 has its own: EBBG FT8716 and Tianma NT36672A (LCD, both qcom,mdss-dsi-panel-peak-brightness 4200000 =
++ * 420 nits) behind the PMI8998 WLED, 20 mA full scale per string (qcom,fs-curr-ua). The light follows the current, so the
++ * mid point is 7 mA = 147 nits; the minimum is about the 16/4095 brightness floor (2 nits).
+  */
+-#define SWEET_DSI_PANEL_NITS    430
+-#define SWEET_DSI_PANEL_MID     140
+-#define SWEET_DSI_PANEL_MIN     2
+-#define SWEET_DSI_MA_MAX        30
+-#define SWEET_DSI_MA_MID        10
++struct sweet_panel_cal {
++	uint16_t nits[33];      /* slider position -> nits, evenly spaced: min + (peak - min) * x^2.2 */
++	uint16_t peak, mid, min, maMax, maMid;
++};
++static const struct sweet_panel_cal sweet_cal_dipper = {    /* Mi 8, Tianma RM69299 OLED (3018) */
++	{ 2, 2, 3, 4, 6, 9, 13, 17, 22, 28, 35, 43, 51, 61, 71, 83, 95, 108, 123, 138, 154, 171, 190, 209, 229, 251, 273, 297, 321,
++	  347, 373, 401, 430 },
++	430, 140, 2, 30, 10,
++};
++static const struct sweet_panel_cal sweet_cal_beryllium = { /* Poco F1, EBBG / Tianma LCD on the WLED (3117) */
++	{ 2, 2, 3, 4, 6, 9, 13, 17, 22, 28, 34, 42, 50, 60, 70, 81, 93, 106, 120, 135, 151, 167, 185, 204, 224, 245, 267, 290, 314,
++	  339, 365, 392, 420 },
++	420, 147, 2, 20, 7,
++};
+ 
+ static void
+ sweet_dsi_fixed(OSDictionary *d, const char *key, uint32_t value)
+@@ -285,18 +297,13 @@ sweet_dsi_fixed(OSDictionary *d, const char *key, uint32_t value)
+ }
+ 
+ static void
+-sweet_dsi_publish_panel(IOService *svc)
++sweet_dsi_publish_panel(IOService *svc, const struct sweet_panel_cal *p)
+ {
+-	/* slider position -> nits, evenly spaced, 2 + 428 * x^2.2 */
+-	static const uint16_t nits[33] = {
+-		2, 2, 3, 4, 6, 9, 13, 17, 22, 28, 35, 43, 51, 61, 71, 83, 95, 108, 123, 138, 154, 171, 190, 209, 229, 251, 273, 297, 321,
+-		347, 373, 401, 430,
+-	};
+ 	uint32_t table[33];
+ 	OSDictionary *cal = OSDictionary::withCapacity(10);
+ 
+ 	for (unsigned i = 0; i < 33; i++) {
+-		table[i] = (uint32_t)nits[i] << 16;
++		table[i] = (uint32_t)p->nits[i] << 16;
+ 	}
+ 	OSData *t = OSData::withBytes(table, sizeof(table));
+ 	if (t != NULL) {
+@@ -304,15 +311,15 @@ sweet_dsi_publish_panel(IOService *svc)
+ 		t->release();
+ 	}
+ 	if (cal != NULL) {
+-		sweet_dsi_fixed(cal, "current-for-max-backlight", SWEET_DSI_MA_MAX);
+-		sweet_dsi_fixed(cal, "current-for-mid-backlight", SWEET_DSI_MA_MID);
+-		sweet_dsi_fixed(cal, "hardware-max-current-limit", SWEET_DSI_MA_MAX);
+-		sweet_dsi_fixed(cal, "lMaxProduct", SWEET_DSI_PANEL_NITS);
+-		sweet_dsi_fixed(cal, "lMidProduct", SWEET_DSI_PANEL_MID);
+-		sweet_dsi_fixed(cal, "lMinProduct", SWEET_DSI_PANEL_MIN);
+-		sweet_dsi_fixed(cal, "lMaxPanel", SWEET_DSI_PANEL_NITS);
+-		sweet_dsi_fixed(cal, "lMidPanel", SWEET_DSI_PANEL_MID);
+-		sweet_dsi_fixed(cal, "lMinPanel", SWEET_DSI_PANEL_MIN);
++		sweet_dsi_fixed(cal, "current-for-max-backlight", p->maMax);
++		sweet_dsi_fixed(cal, "current-for-mid-backlight", p->maMid);
++		sweet_dsi_fixed(cal, "hardware-max-current-limit", p->maMax);
++		sweet_dsi_fixed(cal, "lMaxProduct", p->peak);
++		sweet_dsi_fixed(cal, "lMidProduct", p->mid);
++		sweet_dsi_fixed(cal, "lMinProduct", p->min);
++		sweet_dsi_fixed(cal, "lMaxPanel", p->peak);
++		sweet_dsi_fixed(cal, "lMidPanel", p->mid);
++		sweet_dsi_fixed(cal, "lMinPanel", p->min);
+ 		svc->setProperty("backlight-calibration-parameters", cal);
+ 		cal->release();
+ 	}
+@@ -891,15 +898,15 @@ AppleCLCD::start(IOService *provider)
+ 		if (blfade) {
+ 			blInit();
+ 			dsiInit();
+-			/* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on. 3019: the Mi 8 has its panel data (3018) */
+-			int blsvc = fDsi != 0;
++			/* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on. 3019: the Mi 8 has its panel data (3018).
++			 * 3117: the Poco F1 too, when the WLED is armed: without the service CoreBrightness has no display and SpringBoard
++			 * starts with the display "Off" (the phone came up asleep). sweetfb_blsvc=0 turns it off again. */
++			int blsvc = fDsi != 0 || (fBlOK && sweet_board_beryllium());
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+ 			if (blsvc && (fBacklight = OSTypeAlloc(AppleARMBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+ 				fBacklight->fFB = this;
+ 				fBacklight->setProperty("backlight-control", true);
+-				if (fDsi != 0) {
+-					sweet_dsi_publish_panel(fBacklight);
+-				}
++				sweet_dsi_publish_panel(fBacklight, fDsi != 0 ? &sweet_cal_dipper : &sweet_cal_beryllium);
+ 				OSDictionary *dp = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);
+ 				if (dp && br) {
+ 					OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber(4095ULL, 32),
+@@ -2943,14 +2950,14 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	/*
+ 	 * CoreBrightness' own request: "brightness-nits" = nits * 65536 as a SInt32 (it also sets IOMFBBrightnessLevel on
+ 	 * the framebuffer, result ignored). Map nits linearly onto the WLED range; sweetfb_blnits = the panel's peak nits
+-	 * (default 500). Digital dimming below the backlight minimum is CB's business (it only engages when the request is
++	 * (default: the panel data's, 430 Mi 8 / 420 Poco F1, 3117). Digital dimming below the backlight minimum is CB's business (it only engages when the request is
+ 	 * under the minimum it read from the service; this service advertises none).
+ 	 */
+ 	OSNumber *nits = OSDynamicCast(OSNumber, d->getObject("brightness-nits"));
+ 	if (nits != NULL && fFB != NULL) {
+ 		static uint32_t peak;
+ 		if (peak == 0) {
+-			int v = fFB->fDsi != 0 ? SWEET_DSI_PANEL_NITS : 500;
++			int v = fFB->fDsi != 0 ? sweet_cal_dipper.peak : sweet_cal_beryllium.peak;
+ 			PE_parse_boot_argn("sweetfb_blnits", &v, sizeof(v));
+ 			peak = (v >= 50 && v <= 2000) ? (uint32_t)v : 500;
+ 		}
