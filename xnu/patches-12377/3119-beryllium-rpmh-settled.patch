@@ -6,8 +6,8 @@ incomplete state after the trigger, to rule out stale CMD_STATUS. A vote that ch
 the level an earlier vote set, a regulator already on) finishes before the first poll: the TCS reads idle with every
 command ISSUED|COMPLETE from the start, no progress is ever seen, and after 100 ms the request was taken for a
 timeout, the TCS quarantined and RPMh refused for the rest of the boot. On the Poco F1 that is the audio DSP's cx
-vote (no audio for the whole boot; 6 of 41 saved boot logs before, and every boot of the 3117/3118 kernels, where the
-layout moved the first poll) and once Wi-Fi's ldoa17 enable (no Wi-Fi). A request that stays idle and complete,
+vote (no audio for the whole boot; 4 of 37 older saved boot logs, and all 4 boots of the 3117/3118 kernels, whose
+layout makes the first poll late enough every time) and once Wi-Fi's ldoa17 enable (no Wi-Fi). A request that stays idle and complete,
 unchanged, for 1 ms after the trigger, with CONTROL still reading AMC_EN|TRIGGER (our trigger landed; every saved
 log, good or bad, reads 0x1010000 there), now counts as done (logged, first 4 per boot); a busy TCS or an incomplete
 command still times out as before.
