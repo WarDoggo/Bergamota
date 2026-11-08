@@ -253,6 +253,7 @@ static int write_allowed(unsigned sid, unsigned addr, unsigned len)
 	if (sid != SID_WLED)
 		return 0;
 	switch (addr) {
+	case 0xd846:	/* control MOD_EN: the module on / off (charge_mode.c blank/wake) */
 	case 0xd947:	/* sink SYNC */
 		return len == 1;
 	case 0xd957:	/* string 0 / 1 brightness, 16 bit */
@@ -320,6 +321,21 @@ int pmic_wled_enabled(void)
 	uint8_t m;
 
 	return !spmi_read(SID_WLED, WLED_MOD_EN, &m) && (m & 0x80);
+}
+
+/*
+ * The WLED module on (0x80) or off (0x00). Brightness 0 with the module on still lights the strings faintly
+ * (qcom-wled.c switches the module off at 0). A fixed value (bit 7; the other bits are reserved and read 0), then
+ * read back: 0 only when it reads as asked.
+ */
+int pmic_wled_module(int on)
+{
+	uint8_t want = on ? 0x80 : 0x00, got;
+
+	if (spmi_write(WLED_MOD_EN, want, 1))
+		return -1;
+	udelay(100);
+	return !spmi_read(SID_WLED, WLED_MOD_EN, &got) && got == want ? 0 : -1;
 }
 
 static int wled_put(const uint16_t v[2])
