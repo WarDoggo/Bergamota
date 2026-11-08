@@ -42,6 +42,15 @@
  * receiver's IO ends, EAR_OFF takes the earpiece path down. Mono, its own volume and mute, no speaker guard; on the
  * Poco F1 7.5 dB under its volume, because the amp plays the earpiece at gain 15 (kProtectsRecTrimDB).
  *
+ * A fifth device, UID "SweetHeadphones" (2 channels), is the Poco F1's 3.5 mm jack: it is in the device list only while
+ * the kernel's jack detector says headphones are plugged in (kern.sweet_jack bits 0 and 1, xnu 3111; polled twice a
+ * second) or while the test switch file kHpTestSwitch exists. The iPhone 11 has no jack, so iOS's routing for the
+ * built-in "Codec" device has no wired headphones; the device says it is USB instead, the way iOS takes Lightning and
+ * USB-C headphones (VirtualAudio's Device_USB_Aspen). It shares the kernel player with "Speaker" and "Receiver" like
+ * those two (the output whose IO started last owns it), started with START_HPH (xnu 3113: the codec's HPHL/HPHR path
+ * comes up first if needed, 3112); its IO end and an unplug take the path down (HPH_OFF). Stereo, its own volume and
+ * mute, no speaker guard; the kernel's kern.sweet_hph_gain sets the codec's own gains.
+ *
  * Logs to the unified log, subsystem com.sweet.SweetSpeaker (`sweetlog 60 SweetSpeaker`).
  */
 #include <CoreAudio/AudioServerPlugIn.h>
@@ -73,6 +82,10 @@ enum {
 	kObjectID_ReceiverStream = 12,
 	kObjectID_RecVolume = 13,
 	kObjectID_RecMute = 14,
+	kObjectID_Hp = 15,              /* the Poco F1's headphones: listed only while plugged in */
+	kObjectID_HpStream = 16,
+	kObjectID_HpVolume = 17,
+	kObjectID_HpMute = 18,
 };
 
 #define kDeviceUID              "Speaker"
@@ -83,6 +96,10 @@ enum {
 #define kMicModelUID            "SweetMic"
 #define kReceiverUID            "Receiver"
 #define kReceiverModelUID       "SweetReceiver"
+#define kHpUID                  "SweetHeadphones"
+#define kHpModelUID             "SweetHeadphones"
+#define kHpTestSwitch           "/private/var/tmp/sweethp.on"   /* exists: the headphone device is shown, plugged or not */
+#define kHpPollUs               500000u         /* the jack poll: kern.sweet_jack twice a second */
 #define kMicRing                65536u          /* samples of the local capture ring (1.4 s), a power of 2 */
 #define kMicDelay               2880u           /* 60 ms: 2 of the kernel's 20 ms pieces + the reader's 5 ms polls + margin */
 #define kMicSafetyOffset        480u
@@ -114,7 +131,8 @@ enum {
 
 /* kern.sweet_audio_play (dipper_audio.c) */
 enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4, PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6,
-       PL_OP_EAR_OFF = 7 };              /* 5-7: xnu 3067j */
+       PL_OP_EAR_OFF = 7,                /* 5-7: xnu 3067j */
+       PL_OP_START_HPH = 8, PL_OP_HPH_OFF = 9 };       /* xnu 3113 */
 struct pl_status {
 	uint32_t state, result, ring, period;
 	uint64_t written, sent, played;
@@ -186,6 +204,14 @@ static Float32 gRecVolumeScalar = 0.75f;
 static Float32 gRecTrimDB;                      /* kProtectsRecTrimDB on the Poco F1, set once at Initialize */
 static UInt32 gRecMute;
 static AudioObjectID gOut;
+/* the headphones: listed while plugged in (gHpPresent, set by the jack thread under gStateMutex) */
+static Boolean gHpPresent;
+static UInt32 gHpIOCount;
+static UInt64 gHpAnchorHostTime;
+static Float32 gHpVolumeScalar = 0.5f;
+static UInt32 gHpMute;
+static void *jack_thread(void *arg);
+static bool hp_should_show(int *jack);
 /*
  * The mic's input data sources: VirtualAudio's SubPortPolicy reads the device's kAudioDevicePropertyDataSource ('ssrc',
  * input scope, a list), writes the built-in mic's active sub-ports there ('imic' 'smic' 'fmic' 'lmic' on this N104
@@ -226,6 +252,21 @@ receiver_gain(void)
 		return 0.0f;
 	}
 	return powf(10.0f, (volume_db(gRecVolumeScalar) + gRecTrimDB) / 20.0f);
+}
+
+static float
+headphone_gain(void)
+{
+	if (gHpMute || gHpVolumeScalar <= 0.0f) {
+		return 0.0f;
+	}
+	return powf(10.0f, volume_db(gHpVolumeScalar) / 20.0f);
+}
+
+static const char *
+out_name(AudioObjectID d)
+{
+	return d == kObjectID_Receiver ? "earpiece" : d == kObjectID_Hp ? "headphones" : "speaker";
 }
 
 /* data comes from the IO thread only (its own buffer); start/stop from the HAL's other threads */
@@ -279,9 +320,16 @@ is_receiver(AudioObjectID o)
 }
 
 static bool
+is_hp(AudioObjectID o)
+{
+	return o == kObjectID_Hp || o == kObjectID_HpStream || o == kObjectID_HpVolume || o == kObjectID_HpMute;
+}
+
+static bool
 is_device(AudioObjectID o)
 {
-	return o == kObjectID_Device || o == kObjectID_Actuator || o == kObjectID_Mic || o == kObjectID_Receiver;
+	return o == kObjectID_Device || o == kObjectID_Actuator || o == kObjectID_Mic || o == kObjectID_Receiver ||
+	    o == kObjectID_Hp;
 }
 
 static UInt32
@@ -476,8 +524,16 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	gHostTicksPerFrame = (1e9 * tb.denom / tb.numer) / kSampleRate;
-	os_log(gLog, "SweetSpeaker: initialized, devices %{public}s, %{public}s, %{public}s, %{public}s, %.1f host ticks per frame",
-	    kDeviceUID, kActuatorUID, kMicUID, kReceiverUID, gHostTicksPerFrame);
+	int jack = 0;
+	gHpPresent = hp_should_show(&jack);
+	pthread_t jth;
+	bool watching = pthread_create(&jth, NULL, jack_thread, NULL) == 0;
+	if (watching) {
+		pthread_detach(jth);
+	}
+	os_log(gLog, "SweetSpeaker: initialized, devices %{public}s, %{public}s, %{public}s, %{public}s, %{public}s (%{public}s, "
+	    "jack %#x, %{public}s), %.1f host ticks per frame", kDeviceUID, kActuatorUID, kMicUID, kReceiverUID, kHpUID,
+	    gHpPresent ? "shown" : "not shown", jack, watching ? "watched" : "NOT watched", gHostTicksPerFrame);
 	return kAudioHardwareNoError;
 }
 
@@ -531,10 +587,8 @@ SS_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObje
 #pragma mark - properties
 
 static Boolean
-SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID,
-    const AudioObjectPropertyAddress *inAddress)
+has_property(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, const AudioObjectPropertyAddress *inAddress)
 {
-	(void)inClientProcessID;
 	if (inDriver != gDriverRef || !inAddress) {
 		return false;
 	}
@@ -558,9 +612,10 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 	case kObjectID_Actuator:
 	case kObjectID_Mic:
 	case kObjectID_Receiver:
+	case kObjectID_Hp:
 		switch (inAddress->mSelector) {
 		case kAudioDevicePropertyPreferredChannelsForStereo:
-			return inObjectID == kObjectID_Device;
+			return inObjectID == kObjectID_Device || inObjectID == kObjectID_Hp;
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
 		case kAudioObjectPropertyOwner:
@@ -606,6 +661,7 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 	case kObjectID_ActuatorStream:
 	case kObjectID_MicStream:
 	case kObjectID_ReceiverStream:
+	case kObjectID_HpStream:
 		switch (inAddress->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
@@ -626,6 +682,7 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 		return false;
 	case kObjectID_Volume:
 	case kObjectID_RecVolume:
+	case kObjectID_HpVolume:
 		switch (inAddress->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
@@ -643,6 +700,7 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 		return false;
 	case kObjectID_Mute:
 	case kObjectID_RecMute:
+	case kObjectID_HpMute:
 		switch (inAddress->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
@@ -658,6 +716,48 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 	return false;
 }
 
+/*
+ * TEMPORARY, for the headphone device's bring-up (remove once iOS takes it): each property iOS asks of the headphone
+ * objects that they do not have, logged once, to see what VirtualAudio's USB device class looks for.
+ */
+static pthread_mutex_t gHpAskMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+hp_asked(AudioObjectID o, const AudioObjectPropertyAddress *a)
+{
+	static struct {
+		AudioObjectID o;
+		AudioObjectPropertySelector s;
+	} seen[64];
+	static unsigned n;
+	pthread_mutex_lock(&gHpAskMutex);
+	bool known = false;
+	for (unsigned i = 0; i < n && !known; i++) {
+		known = seen[i].o == o && seen[i].s == a->mSelector;
+	}
+	if (!known && n < 64) {
+		seen[n].o = o;
+		seen[n].s = a->mSelector;
+		n++;
+		UInt32 s = a->mSelector, c = a->mScope;
+		os_log(gLog, "SweetSpeaker: headphones: object %u has no '%c%c%c%c' (scope '%c%c%c%c', element %u)", o, (char)(s >> 24),
+		    (char)(s >> 16), (char)(s >> 8), (char)s, (char)(c >> 24), (char)(c >> 16), (char)(c >> 8), (char)c, a->mElement);
+	}
+	pthread_mutex_unlock(&gHpAskMutex);
+}
+
+static Boolean
+SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID,
+    const AudioObjectPropertyAddress *inAddress)
+{
+	(void)inClientProcessID;
+	Boolean r = has_property(inDriver, inObjectID, inAddress);
+	if (!r && inAddress && is_hp(inObjectID)) {
+		hp_asked(inObjectID, inAddress);
+	}
+	return r;
+}
+
 static OSStatus
 SS_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID,
     const AudioObjectPropertyAddress *inAddress, Boolean *outIsSettable)
@@ -668,14 +768,15 @@ SS_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 	AudioObjectPropertySelector s = inAddress->mSelector;
 	bool device = is_device(inObjectID);
 	bool stream = inObjectID == kObjectID_Stream || inObjectID == kObjectID_ActuatorStream || inObjectID == kObjectID_MicStream ||
-	    inObjectID == kObjectID_ReceiverStream;
+	    inObjectID == kObjectID_ReceiverStream || inObjectID == kObjectID_HpStream;
+	bool volume = inObjectID == kObjectID_Volume || inObjectID == kObjectID_RecVolume || inObjectID == kObjectID_HpVolume;
+	bool mute = inObjectID == kObjectID_Mute || inObjectID == kObjectID_RecMute || inObjectID == kObjectID_HpMute;
 	*outIsSettable = (device && s == kAudioDevicePropertyNominalSampleRate) ||
 	    (inObjectID == kObjectID_MicSource && s == kAudioSelectorControlPropertyCurrentItem) ||
 	    (stream && (s == kAudioStreamPropertyIsActive || s == kAudioStreamPropertyVirtualFormat ||
 	    s == kAudioStreamPropertyPhysicalFormat)) ||
-	    ((inObjectID == kObjectID_Volume || inObjectID == kObjectID_RecVolume) && (s == kAudioLevelControlPropertyScalarValue ||
-	    s == kAudioLevelControlPropertyDecibelValue)) ||
-	    ((inObjectID == kObjectID_Mute || inObjectID == kObjectID_RecMute) && s == kAudioBooleanControlPropertyValue);
+	    (volume && (s == kAudioLevelControlPropertyScalarValue || s == kAudioLevelControlPropertyDecibelValue)) ||
+	    (mute && s == kAudioBooleanControlPropertyValue);
 	return kAudioHardwareNoError;
 }
 
@@ -703,8 +804,11 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			OUT(CFStringRef, CFSTR("Bergamota"));
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioPlugInPropertyDeviceList: {
-			AudioObjectID d[4] = { kObjectID_Device, kObjectID_Actuator, kObjectID_Mic, kObjectID_Receiver };
-			return out_ids(d, 4, inDataSize, outDataSize, outData);
+			AudioObjectID d[5] = { kObjectID_Device, kObjectID_Actuator, kObjectID_Mic, kObjectID_Receiver, kObjectID_Hp };
+			pthread_mutex_lock(&gStateMutex);
+			UInt32 n = gHpPresent ? 5 : 4;
+			pthread_mutex_unlock(&gStateMutex);
+			return out_ids(d, n, inDataSize, outDataSize, outData);
 		}
 		case kAudioPlugInPropertyBoxList:
 			*outDataSize = 0;
@@ -720,7 +824,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			    CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kObjectID_Device :
 			    CFStringCompare(uid, CFSTR(kActuatorUID), 0) == kCFCompareEqualTo ? kObjectID_Actuator :
 			    CFStringCompare(uid, CFSTR(kMicUID), 0) == kCFCompareEqualTo ? kObjectID_Mic :
-			    CFStringCompare(uid, CFSTR(kReceiverUID), 0) == kCFCompareEqualTo ? kObjectID_Receiver : kAudioObjectUnknown);
+			    CFStringCompare(uid, CFSTR(kReceiverUID), 0) == kCFCompareEqualTo ? kObjectID_Receiver :
+			    CFStringCompare(uid, CFSTR(kHpUID), 0) == kCFCompareEqualTo && gHpPresent ? kObjectID_Hp : kAudioObjectUnknown);
 		}
 		case kAudioPlugInPropertyResourceBundle:
 			OUT(CFStringRef, CFSTR(""));
@@ -729,8 +834,9 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 	case kObjectID_Device:
 	case kObjectID_Actuator:
 	case kObjectID_Mic:
-	case kObjectID_Receiver: {
-		bool mic = inObjectID == kObjectID_Mic, rcv = inObjectID == kObjectID_Receiver;
+	case kObjectID_Receiver:
+	case kObjectID_Hp: {
+		bool mic = inObjectID == kObjectID_Mic, rcv = inObjectID == kObjectID_Receiver, hp = inObjectID == kObjectID_Hp;
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, kAudioObjectClassID);
@@ -739,13 +845,14 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		case kAudioObjectPropertyOwner:
 			OUT(AudioObjectID, kObjectID_PlugIn);
 		case kAudioObjectPropertyName:
-			OUT(CFStringRef, mic ? CFSTR("Mic") : rcv ? CFSTR("Receiver") : inObjectID == kObjectID_Actuator ? CFSTR("Actuator") :
-			    CFSTR("Speaker"));
+			OUT(CFStringRef, mic ? CFSTR("Mic") : rcv ? CFSTR("Receiver") : hp ? CFSTR("Headphones") :
+			    inObjectID == kObjectID_Actuator ? CFSTR("Actuator") : CFSTR("Speaker"));
 		case kAudioObjectPropertyManufacturer:
 			OUT(CFStringRef, CFSTR("Bergamota"));
 		case kAudioObjectPropertyOwnedObjects: {
 			AudioObjectID all[3] = { kObjectID_Stream, kObjectID_Volume, kObjectID_Mute }, act = kObjectID_ActuatorStream;
 			AudioObjectID rall[3] = { kObjectID_ReceiverStream, kObjectID_RecVolume, kObjectID_RecMute };
+			AudioObjectID hall[3] = { kObjectID_HpStream, kObjectID_HpVolume, kObjectID_HpMute };
 			AudioObjectID mst[2] = { kObjectID_MicStream, kObjectID_MicSource };
 			if (mic) {
 				if (scope == kAudioObjectPropertyScopeOutput) {
@@ -759,25 +866,30 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 				return kAudioHardwareNoError;
 			}
 			return inObjectID == kObjectID_Actuator ? out_ids(&act, 1, inDataSize, outDataSize, outData) :
-			    out_ids(rcv ? rall : all, 3, inDataSize, outDataSize, outData);
+			    out_ids(rcv ? rall : hp ? hall : all, 3, inDataSize, outDataSize, outData);
 		}
 		case kAudioDevicePropertyDeviceUID:
-			OUT(CFStringRef, mic ? CFSTR(kMicUID) : rcv ? CFSTR(kReceiverUID) : inObjectID == kObjectID_Actuator ?
-			    CFSTR(kActuatorUID) : CFSTR(kDeviceUID));
+			OUT(CFStringRef, mic ? CFSTR(kMicUID) : rcv ? CFSTR(kReceiverUID) : hp ? CFSTR(kHpUID) :
+			    inObjectID == kObjectID_Actuator ? CFSTR(kActuatorUID) : CFSTR(kDeviceUID));
 		case kAudioDevicePropertyModelUID:
-			OUT(CFStringRef, mic ? CFSTR(kMicModelUID) : rcv ? CFSTR(kReceiverModelUID) : inObjectID == kObjectID_Actuator ?
-			    CFSTR(kActuatorModelUID) : CFSTR(kDeviceModelUID));
+			OUT(CFStringRef, mic ? CFSTR(kMicModelUID) : rcv ? CFSTR(kReceiverModelUID) : hp ? CFSTR(kHpModelUID) :
+			    inObjectID == kObjectID_Actuator ? CFSTR(kActuatorModelUID) : CFSTR(kDeviceModelUID));
 		case kAudioDevicePropertyTransportType:
-			OUT(UInt32, kAudioDeviceTransportTypeBuiltIn);
+			OUT(UInt32, hp ? kAudioDeviceTransportTypeUSB : kAudioDeviceTransportTypeBuiltIn);
 		case kAudioDevicePropertyRelatedDevices:
 			return out_ids(&inObjectID, 1, inDataSize, outDataSize, outData);
 		case kAudioDevicePropertyClockDomain:
 			OUT(UInt32, 0);
-		case kAudioDevicePropertyDeviceIsAlive:
-			OUT(UInt32, 1);
+		case kAudioDevicePropertyDeviceIsAlive: {
+			pthread_mutex_lock(&gStateMutex);
+			UInt32 alive = !hp || gHpPresent;
+			pthread_mutex_unlock(&gStateMutex);
+			OUT(UInt32, alive);
+		}
 		case kAudioDevicePropertyDeviceIsRunning: {
 			pthread_mutex_lock(&gStateMutex);
-			UInt32 running = (mic ? gMicIOCount : rcv ? gRecIOCount : inObjectID == kObjectID_Actuator ? gActIOCount : gIOCount) > 0;
+			UInt32 running = (mic ? gMicIOCount : rcv ? gRecIOCount : hp ? gHpIOCount : inObjectID == kObjectID_Actuator ?
+			    gActIOCount : gIOCount) > 0;
 			pthread_mutex_unlock(&gStateMutex);
 			OUT(UInt32, running);
 		}
@@ -790,8 +902,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			}
 			OUT(UInt32, scope == kAudioObjectPropertyScopeInput ? 0 : kLatency);
 		case kAudioDevicePropertyStreams: {
-			AudioObjectID st = mic ? kObjectID_MicStream : rcv ? kObjectID_ReceiverStream : inObjectID == kObjectID_Actuator ?
-			    kObjectID_ActuatorStream : kObjectID_Stream;
+			AudioObjectID st = mic ? kObjectID_MicStream : rcv ? kObjectID_ReceiverStream : hp ? kObjectID_HpStream :
+			    inObjectID == kObjectID_Actuator ? kObjectID_ActuatorStream : kObjectID_Stream;
 			if (mic ? scope == kAudioObjectPropertyScopeOutput : !is_output_or_global(scope)) {
 				*outDataSize = 0;
 				return kAudioHardwareNoError;
@@ -800,12 +912,12 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		}
 		case kAudioObjectPropertyControlList: {
 			AudioObjectID c[2] = { kObjectID_Volume, kObjectID_Mute }, ms = kObjectID_MicSource;
-			AudioObjectID rc[2] = { kObjectID_RecVolume, kObjectID_RecMute };
+			AudioObjectID rc[2] = { kObjectID_RecVolume, kObjectID_RecMute }, hc[2] = { kObjectID_HpVolume, kObjectID_HpMute };
 			if (mic) {
 				return out_ids(&ms, 1, inDataSize, outDataSize, outData);
 			}
-			if (rcv) {
-				return out_ids(rc, 2, inDataSize, outDataSize, outData);
+			if (rcv || hp) {
+				return out_ids(rcv ? rc : hc, 2, inDataSize, outDataSize, outData);
 			}
 			return out_ids(c, inObjectID == kObjectID_Device ? 2 : 0, inDataSize, outDataSize, outData);
 		}
@@ -859,6 +971,7 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 	case kObjectID_ActuatorStream:
 	case kObjectID_MicStream:
 	case kObjectID_ReceiverStream:
+	case kObjectID_HpStream:
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, kAudioObjectClassID);
@@ -866,10 +979,12 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			OUT(AudioClassID, kAudioStreamClassID);
 		case kAudioObjectPropertyOwner:
 			OUT(AudioObjectID, inObjectID == kObjectID_MicStream ? kObjectID_Mic : inObjectID == kObjectID_ReceiverStream ?
-			    kObjectID_Receiver : inObjectID == kObjectID_ActuatorStream ? kObjectID_Actuator : kObjectID_Device);
+			    kObjectID_Receiver : inObjectID == kObjectID_HpStream ? kObjectID_Hp : inObjectID == kObjectID_ActuatorStream ?
+			    kObjectID_Actuator : kObjectID_Device);
 		case kAudioObjectPropertyName:
 			OUT(CFStringRef, inObjectID == kObjectID_MicStream ? CFSTR("Mic") : inObjectID == kObjectID_ReceiverStream ?
-			    CFSTR("Receiver") : inObjectID == kObjectID_ActuatorStream ? CFSTR("Actuator") : CFSTR("Speaker"));
+			    CFSTR("Receiver") : inObjectID == kObjectID_HpStream ? CFSTR("Headphones") : inObjectID == kObjectID_ActuatorStream ?
+			    CFSTR("Actuator") : CFSTR("Speaker"));
 		case kAudioObjectPropertyOwnedObjects:
 			*outDataSize = 0;
 			return kAudioHardwareNoError;
@@ -879,7 +994,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			OUT(UInt32, inObjectID == kObjectID_MicStream ? 1 : 0);  /* 1 input, 0 output */
 		case kAudioStreamPropertyTerminalType:
 			OUT(UInt32, inObjectID == kObjectID_MicStream ? kAudioStreamTerminalTypeMicrophone :
-			    inObjectID == kObjectID_ReceiverStream ? kAudioStreamTerminalTypeReceiverSpeaker : kAudioStreamTerminalTypeSpeaker);
+			    inObjectID == kObjectID_ReceiverStream ? kAudioStreamTerminalTypeReceiverSpeaker :
+			    inObjectID == kObjectID_HpStream ? kAudioStreamTerminalTypeHeadphones : kAudioStreamTerminalTypeSpeaker);
 		case kAudioStreamPropertyStartingChannel:
 			OUT(UInt32, 1);
 		case kAudioStreamPropertyLatency:
@@ -938,17 +1054,20 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 	case kObjectID_Volume:
 	case kObjectID_Mute:
 	case kObjectID_RecVolume:
-	case kObjectID_RecMute: {
-		bool vol = inObjectID == kObjectID_Volume || inObjectID == kObjectID_RecVolume;
+	case kObjectID_RecMute:
+	case kObjectID_HpVolume:
+	case kObjectID_HpMute: {
+		bool vol = inObjectID == kObjectID_Volume || inObjectID == kObjectID_RecVolume || inObjectID == kObjectID_HpVolume;
 		bool rc = inObjectID == kObjectID_RecVolume || inObjectID == kObjectID_RecMute;
-		Float32 scalar = rc ? gRecVolumeScalar : gVolumeScalar;
+		bool hc = inObjectID == kObjectID_HpVolume || inObjectID == kObjectID_HpMute;
+		Float32 scalar = rc ? gRecVolumeScalar : hc ? gHpVolumeScalar : gVolumeScalar;
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, vol ? kAudioLevelControlClassID : kAudioBooleanControlClassID);
 		case kAudioObjectPropertyClass:
 			OUT(AudioClassID, vol ? kAudioVolumeControlClassID : kAudioMuteControlClassID);
 		case kAudioObjectPropertyOwner:
-			OUT(AudioObjectID, rc ? kObjectID_Receiver : kObjectID_Device);
+			OUT(AudioObjectID, rc ? kObjectID_Receiver : hc ? kObjectID_Hp : kObjectID_Device);
 		case kAudioObjectPropertyOwnedObjects:
 			*outDataSize = 0;
 			return kAudioHardwareNoError;
@@ -979,7 +1098,7 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			*outDataSize = sizeof(Float32);
 			return kAudioHardwareNoError;
 		case kAudioBooleanControlPropertyValue:
-			OUT(UInt32, rc ? gRecMute : gMute);
+			OUT(UInt32, rc ? gRecMute : hc ? gHpMute : gMute);
 		}
 		break;
 	}
@@ -1077,6 +1196,9 @@ SS_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		if (inObjectID == kObjectID_RecVolume) {
 			gRecVolumeScalar = sc;
 			os_log(gLog, "SweetSpeaker: receiver volume %.3f (%.1f dB, gain %.4f)", sc, volume_db(sc), receiver_gain());
+		} else if (inObjectID == kObjectID_HpVolume) {
+			gHpVolumeScalar = sc;
+			os_log(gLog, "SweetSpeaker: headphone volume %.3f (%.1f dB, gain %.4f)", sc, volume_db(sc), headphone_gain());
 		} else {
 			gVolumeScalar = sc;
 			os_log(gLog, "SweetSpeaker: volume %.3f (%.1f dB, gain %.4f)", gVolumeScalar, volume_db(gVolumeScalar),
@@ -1096,6 +1218,9 @@ SS_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		if (inObjectID == kObjectID_RecMute) {
 			gRecMute = *(const UInt32 *)inData != 0;
 			os_log(gLog, "SweetSpeaker: receiver mute %u", gRecMute);
+		} else if (inObjectID == kObjectID_HpMute) {
+			gHpMute = *(const UInt32 *)inData != 0;
+			os_log(gLog, "SweetSpeaker: headphone mute %u", gHpMute);
 		} else {
 			gMute = *(const UInt32 *)inData != 0;
 			os_log(gLog, "SweetSpeaker: mute %u", gMute);
@@ -1111,13 +1236,17 @@ SS_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 #pragma mark - IO
 
 /*
- * START on gOut's output (START_SPEAKER / START_EAR; a STOP first if the player runs, on the other output or left over),
- * gStateMutex held. EAGAIN: the codec is busy with another step (the helper thread tries again).
+ * START on gOut's output (START_SPEAKER / START_EAR / START_HPH; a STOP first if the player runs, on another output or
+ * left over), gStateMutex held. EAGAIN: the codec is busy with another step (the helper thread tries again). Not on the
+ * headphones once they are unplugged.
  */
 static int
 kernel_start(void)
 {
-	uint32_t op = gOut == kObjectID_Receiver ? PL_OP_START_EAR : PL_OP_START_SPEAKER;
+	if (gOut == kObjectID_Hp && !gHpPresent) {
+		return ENXIO;
+	}
+	uint32_t op = gOut == kObjectID_Receiver ? PL_OP_START_EAR : gOut == kObjectID_Hp ? PL_OP_START_HPH : PL_OP_START_SPEAKER;
 	int e = play_op(op, NULL, 0);
 	if (e == EINVAL && op == PL_OP_START_SPEAKER) {
 		op = PL_OP_START;                       /* a kernel before 3067j: plain START is the speaker */
@@ -1142,16 +1271,16 @@ link_thread(void *arg)
 	for (;;) {
 		sleep(1);
 		pthread_mutex_lock(&gStateMutex);
-		if (!gIOCount && !gRecIOCount) {
+		if (!gIOCount && !gRecIOCount && !gHpIOCount) {
 			gLinkRunning = false;
 			pthread_mutex_unlock(&gStateMutex);
 			return NULL;
 		}
-		if (!atomic_load(&gKernelOK)) {
+		if (gOut && !atomic_load(&gKernelOK) && !(gOut == kObjectID_Hp && !gHpPresent)) {
 			int e = kernel_start();
 			if (e == 0 || tries++ % 60 == 0) {
 				os_log(gLog, "SweetSpeaker: kernel player %{public}s on the %{public}s (%d, try %u)", e ? "still not up" : "on",
-				    gOut == kObjectID_Receiver ? "earpiece" : "speaker", e, tries);
+				    out_name(gOut), e, tries);
 			}
 			if (e == 0) {
 				tries = 0;
@@ -1420,21 +1549,40 @@ mic_read(Float32 *out, UInt32 frames, Float64 t)
 	}
 }
 
+/* gStateMutex held: another output whose IO runs, for the player when its owner stops (headphones first) */
+static AudioObjectID
+other_running_output(AudioObjectID stopping)
+{
+	if (stopping != kObjectID_Hp && gHpIOCount && gHpPresent) {
+		return kObjectID_Hp;
+	}
+	if (stopping != kObjectID_Receiver && gRecIOCount) {
+		return kObjectID_Receiver;
+	}
+	if (stopping != kObjectID_Device && gIOCount) {
+		return kObjectID_Device;
+	}
+	return 0;
+}
+
 /*
- * IO of the two outputs, Speaker and Receiver, which share the kernel player: the one whose IO started last owns it
- * (gOut); when the owner stops while the other still runs, the player restarts there. The receiver's end takes the
- * earpiece path down (EAR_OFF; refused while the player plays on it).
+ * IO of the three outputs, Speaker, Receiver and the headphones, which share the kernel player: the one whose IO started
+ * last owns it (gOut); when the owner stops while another still runs, the player restarts there. The receiver's end
+ * takes the earpiece path down (EAR_OFF), the headphones' end theirs (HPH_OFF); both are refused while the player plays
+ * on that path.
  */
 static OSStatus
 out_io(AudioObjectID dev, bool start)
 {
-	bool rcv = dev == kObjectID_Receiver;
+	bool rcv = dev == kObjectID_Receiver, hp = dev == kObjectID_Hp;
 	pthread_mutex_lock(&gStateMutex);
-	UInt32 *count = rcv ? &gRecIOCount : &gIOCount;
+	UInt32 *count = rcv ? &gRecIOCount : hp ? &gHpIOCount : &gIOCount;
 	if (start && (*count)++ == 0) {
 		UInt64 now = mach_absolute_time();
 		if (rcv) {
 			gRecAnchorHostTime = now;
+		} else if (hp) {
+			gHpAnchorHostTime = now;
 		} else {
 			gAnchorHostTime = now;
 			if (gStopHostTime) {            /* the speaker cooled while nothing played */
@@ -1450,8 +1598,9 @@ out_io(AudioObjectID dev, bool start)
 		}
 		gOut = dev;
 		int e = kernel_start();                 /* here, so the first sound is not lost; else the helper retries */
-		os_log(gLog, "SweetSpeaker: %{public}s start IO: kernel player %{public}s (%d), gain %.4f", rcv ? "receiver" : "speaker",
-		    e ? "not up yet" : "on", e, rcv ? receiver_gain() : output_gain());
+		os_log(gLog, "SweetSpeaker: %{public}s start IO: kernel player %{public}s (%d), gain %.4f", rcv ? "receiver" :
+		    hp ? "headphone" : "speaker", e ? "not up yet" : "on", e, rcv ? receiver_gain() : hp ? headphone_gain() :
+		    output_gain());
 		pthread_t th;
 		if (!gLinkRunning && pthread_create(&th, NULL, link_thread, NULL) == 0) {
 			pthread_detach(th);
@@ -1462,17 +1611,16 @@ out_io(AudioObjectID dev, bool start)
 			if (atomic_exchange(&gKernelOK, false)) {
 				play_op(PL_OP_STOP, NULL, 0);
 			}
-			UInt32 other = rcv ? gIOCount : gRecIOCount;
-			gOut = other ? (rcv ? kObjectID_Device : kObjectID_Receiver) : 0;
+			gOut = other_running_output(dev);
 			if (gOut) {
 				int e = kernel_start();
-				os_log(gLog, "SweetSpeaker: the player goes back to the %{public}s (%d)", rcv ? "speaker" : "earpiece", e);
+				os_log(gLog, "SweetSpeaker: the player goes back to the %{public}s (%d)", out_name(gOut), e);
 			}
 		}
-		if (rcv) {
-			int e = play_op(PL_OP_EAR_OFF, NULL, 0);
-			os_log(gLog, "SweetSpeaker: receiver stop IO: %u cycles, %u frames dropped, %u write errors; earpiece off %d",
-			    gDiag.cycles, gDropped, gErrors, e);
+		if (rcv || hp) {
+			int e = play_op(rcv ? PL_OP_EAR_OFF : PL_OP_HPH_OFF, NULL, 0);
+			os_log(gLog, "SweetSpeaker: %{public}s stop IO: %u cycles, %u frames dropped, %u write errors; %{public}s off %d",
+			    rcv ? "receiver" : "headphone", gDiag.cycles, gDropped, gErrors, rcv ? "earpiece" : "headphone path", e);
 		} else {
 			gStopHostTime = mach_absolute_time();
 			os_log(gLog, "SweetSpeaker: stop IO: the guard took at most %.1f dB off", -guard_take_min_db(&gGuard));
@@ -1487,6 +1635,62 @@ out_io(AudioObjectID dev, bool start)
 	return kAudioHardwareNoError;
 }
 
+/* the headphones are shown when kern.sweet_jack says plugged in with the detector on, or the test switch file exists */
+static bool
+hp_should_show(int *jack)
+{
+	int v = 0;
+	size_t len = sizeof(v);
+	if (sysctlbyname("kern.sweet_jack", &v, &len, NULL, 0) != 0) {
+		v = 0;                                  /* a kernel without the jack detector (before 3111), or the Mi 8 */
+	}
+	*jack = v;
+	return (v & 3) == 3 || access(kHpTestSwitch, F_OK) == 0;
+}
+
+/*
+ * Twice a second: the headphone device in or out of the device list. On an unplug the player stops if it plays on them
+ * (iOS moves its route itself; nothing is handed to the speaker from here) and their codec path goes down.
+ */
+static void *
+jack_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		usleep(kHpPollUs);
+		int jack = 0;
+		bool show = hp_should_show(&jack);
+		pthread_mutex_lock(&gStateMutex);
+		bool was = gHpPresent;
+		gHpPresent = show;
+		int stop = -1, off = -1;
+		if (was && !show) {
+			if (gOut == kObjectID_Hp) {
+				stop = atomic_exchange(&gKernelOK, false) ? play_op(PL_OP_STOP, NULL, 0) : 0;
+				gOut = 0;
+			}
+			off = play_op(PL_OP_HPH_OFF, NULL, 0);
+		}
+		UInt32 io = gHpIOCount;
+		pthread_mutex_unlock(&gStateMutex);
+		if (show == was) {
+			continue;
+		}
+		if (show) {
+			os_log(gLog, "SweetSpeaker: headphones plugged in (jack %#x): device %{public}s shown", jack, kHpUID);
+		} else {
+			os_log(gLog, "SweetSpeaker: headphones unplugged (jack %#x): device removed, IO %u, player stop %d, path off %d",
+			    jack, io, stop, off);
+		}
+		AudioObjectPropertyAddress a[2] = {
+			{ kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+			{ kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain }
+		};
+		gHost->PropertiesChanged(gHost, kObjectID_PlugIn, 2, a);
+	}
+	return NULL;
+}
+
 static OSStatus
 SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
 {
@@ -1497,7 +1701,8 @@ SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, 
 	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Mic) {
 		return mic_io(true);
 	}
-	if (inDriver != gDriverRef || (inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Receiver)) {
+	if (inDriver != gDriverRef || (inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Receiver &&
+	    inDeviceObjectID != kObjectID_Hp)) {
 		return kAudioHardwareBadObjectError;
 	}
 	return out_io(inDeviceObjectID, true);
@@ -1513,7 +1718,8 @@ SS_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, U
 	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Mic) {
 		return mic_io(false);
 	}
-	if (inDriver != gDriverRef || (inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Receiver)) {
+	if (inDriver != gDriverRef || (inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Receiver &&
+	    inDeviceObjectID != kObjectID_Hp)) {
 		return kAudioHardwareBadObjectError;
 	}
 	return out_io(inDeviceObjectID, false);
@@ -1526,7 +1732,8 @@ SS_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceO
 {
 	(void)inDriver; (void)inClientID;
 	UInt64 anchor = inDeviceObjectID == kObjectID_Mic ? gMicAnchorHostTime : inDeviceObjectID == kObjectID_Receiver ?
-	    gRecAnchorHostTime : inDeviceObjectID == kObjectID_Actuator ? gActAnchorHostTime : gAnchorHostTime;
+	    gRecAnchorHostTime : inDeviceObjectID == kObjectID_Hp ? gHpAnchorHostTime : inDeviceObjectID == kObjectID_Actuator ?
+	    gActAnchorHostTime : gAnchorHostTime;
 	Float64 ticks = gHostTicksPerFrame * kZeroTimeStampPeriod;
 	UInt64 n = (UInt64)((Float64)(mach_absolute_time() - anchor) / ticks);
 	*outSampleTime = (Float64)(n * kZeroTimeStampPeriod);
@@ -1576,7 +1783,10 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 	    inDeviceObjectID != gOut) {
 		return kAudioHardwareNoError;           /* the other output owns the player */
 	}
-	bool rcv = inDeviceObjectID == kObjectID_Receiver;
+	bool rcv = inDeviceObjectID == kObjectID_Receiver, hp = inDeviceObjectID == kObjectID_Hp;
+	if (hp && !gHpPresent) {
+		return kAudioHardwareNoError;           /* unplugged: nothing more goes to the headphones */
+	}
 	UInt32 inch = rcv ? 1u : kChannels;            /* the receiver is mono: both kernel channels get it */
 	if (atomic_exchange(&gResync, false)) {
 		gNextSample = -1;
@@ -1638,12 +1848,16 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 		}
 	}
 	static float work[PL_DATA_MAX / sizeof(int16_t)];
-	float g = rcv ? receiver_gain() : output_gain();
+	float g = rcv ? receiver_gain() : hp ? headphone_gain() : output_gain();
 	while (frames) {
 		UInt32 n = frames < PL_DATA_MAX / (kChannels * sizeof(int16_t)) ? frames : PL_DATA_MAX / (kChannels * sizeof(int16_t));
 		if (rcv) {
 			for (UInt32 i = 0; i < n; i++) {
 				work[2 * i] = work[2 * i + 1] = in[i] * g;
+			}
+		} else if (hp) {
+			for (UInt32 i = 0; i < n * kChannels; i++) {
+				work[i] = in[i] * g;            /* no speaker guard: the codec's own gains limit the level */
 			}
 		} else {
 			for (UInt32 i = 0; i < n * kChannels; i++) {
