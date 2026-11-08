@@ -9,7 +9,7 @@
  * Everything is READ ONLY (battery fuel gauge + SCHG status on PMI8998 = SID 2, PM8998 PON =
  * SID 0) except (a) the PMI8998 WLED backlight brightness (SID 3, peripheral 0xd9), which
  * pmic_wled_set() writes through the arbiter's write channel (the five registers of the kernel's
- * backlight fade) and (b) the seven SMB2 charger registers of the kernel's sweetcharger=2 control,
+ * backlight fade; pmic_wled_module() also MOD_EN 0xd846, as kernel patch 3116) and (b) the seven SMB2 charger registers of the kernel's sweetcharger=2 control,
  * through pmic_chg_write() (charger.c). No other write is reachable.
  */
 
@@ -49,6 +49,7 @@ int pmic_pon_reason(void);
 int pmic_wled_get(uint16_t v[2]);
 int pmic_wled_set(const uint16_t v[2]);	/* 0 = written, latched and read back, -1 = not (originals restored) */
 int pmic_wled_enabled(void);		/* MOD_EN bit 7 */
+int pmic_wled_module(int on);		/* MOD_EN = 0x80 / 0x00, read back: 0 = done (brightness 0 alone still glows) */
 
 /* SMB2 charger (SID 2): read any readable register (CHGR 0x10, USBIN 0x13, MISC 0x16, FG 0x40/0x41). */
 int pmic_chg_read(unsigned addr, uint8_t *v);
