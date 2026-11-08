@@ -1,0 +1,110 @@
+From: Poco F1 iOS port
+Subject: [PATCH] framebuffer: switch the Poco F1 backlight fully off with the screen
+
+When iOS turned the screen off, blSet(false) wrote WLED brightness 0 to both strings but left the PMI8998 WLED
+module on (MOD_EN 0xd846 bit 7, as ABL set it), and brightness 0 with the module on still lights the strings
+faintly: the sleeping phone showed a very dim screen instead of a dark one. qcom-wled.c switches the module off at
+brightness 0; blSet now does the same: off = brightness 0, then MOD_EN 0x00; on = the brightness, then MOD_EN 0x80
+(the order of wled_update_status). The value is written only when it reads otherwise and is read back, retried with
+the brightness. MOD_EN (one byte) joins the SPMI write whitelist for SID 3. The log line shows the MOD_EN read-back.
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 9c0f43e..f9498e7 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -239,7 +239,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  *   0x47        WLED3_SINK_REG_SYNC (one byte)
+  *   0x57 0x67   WLED4_SINK_REG_BRIGHT(0/1), 16-bit little endian (1 or 2 bytes)
+  *   0x58 0x68   their high bytes (one byte)
+- * Nothing in the control module (0xd8: MOD_EN, OVP, boost) is writable.
++ * Control module 0xd8: only MOD_EN 0xd846 (one byte; patch 3116 switches the
++ * module off with the screen and on again). OVP and boost are not writable.
+  * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte), the reboot reason
+  * of qcom-pon.c (written by sweet_reboot.c, read-modify-write), and
+  * PON_PS_HOLD_RST_CTL / _CTL2 (0x85a, 0x85b, one byte each), set to shutdown
+@@ -319,6 +320,7 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 	case 0xd34au:
+ 	case 0xd34cu:
+ 		return len == 1;
++	case 0xd846u:   /* WLED MOD_EN (3116) */
+ 	case 0xd947u:
+ 	case 0xd958u:
+ 	case 0xd968u:
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6d29009..712742f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2734,12 +2734,17 @@ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
+  * WLED4_SINK_REG_BRIGHT(n) = +0x57 + 0x10 * n (16 bit little endian, max
+  * 0xfff), WLED3_SINK_REG_SYNC +0x47 (clear, then set the string mask to
+  * latch a new brightness). Poco F1 has two strings (qcom,num-strings = 2).
+- * The control module (0xd846 MOD_EN bit 7) is never written: the fade only
+- * moves the brightness and leaves the driver stage as ABL set it up.
++ * 3116: brightness 0 alone leaves the strings faintly lit (the phone slept
++ * with a very dim screen instead of a dark one). Like qcom-wled.c, which
++ * switches the module off at brightness 0 (wled_module_enable), blSet turns
++ * the control module (0xd846 MOD_EN, bit 7; the other bits are reserved and
++ * read 0) off after brightness 0 and on again after the brightness is back.
++ * OVP and boost stay as ABL set them up.
+  */
+ #define SWEET_WLED_SID          3
+ #define SWEET_WLED_SINK         0xd900u
+ #define SWEET_WLED_MOD_EN       0xd846u
++#define SWEET_WLED_MOD_ON       0x80u   /* WLED3_CTRL_REG_MOD_EN: BIT(7) module enable */
+ #define SWEET_WLED_SYNC         (SWEET_WLED_SINK + 0x47u)
+ #define SWEET_WLED_BRIGHT(n)    (SWEET_WLED_SINK + 0x57u + 0x10u * (n))
+ #define SWEET_WLED_STRINGS      2
+@@ -2757,6 +2762,30 @@ sweet_wled_read16(unsigned string, uint16_t *out)
+ 	return 0;
+ }
+ 
++/*
++ * 3116: the WLED module on (0x80) or off (0x00), written only when it reads otherwise, then read back. A fixed value,
++ * not a read-modify-write: single SPMI reads have come back 0xffff-like, and that must not land in the register.
++ * 0: MOD_EN now reads exactly what was asked; *got = the byte read.
++ */
++static int
++sweet_wled_module(bool on, uint8_t *got)
++{
++	uint8_t want = on ? SWEET_WLED_MOD_ON : 0x00u, mod = 0xff;
++	if (sweet_spmi_read(SWEET_WLED_SID, SWEET_WLED_MOD_EN, &mod) == 0 && mod == want) {
++		*got = mod;
++		return 0;
++	}
++	if (sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_MOD_EN, &want, 1) != 0) {
++		return -1;
++	}
++	mod = 0xff;
++	if (sweet_spmi_read(SWEET_WLED_SID, SWEET_WLED_MOD_EN, &mod) != 0) {
++		return -1;
++	}
++	*got = mod;
++	return mod == want ? 0 : -1;
++}
++
+ void
+ AppleCLCD::blInit(void)
+ {
+@@ -2946,6 +2975,7 @@ AppleARMBacklight::setProperties(OSObject *properties)
+  * 0242: the WLED straight to off (0) or to the brightness it had (fBlRaw), on the vsync timer (the only caller, so no
+  * lock). Each write is read back; a mismatch or a failed SPMI access is retried up to 3 times (single reads have come
+  * back 0xffff or 0x0100 while the write had landed). Nothing here turns the backlight path off for good.
++ * 3116: off = brightness 0, then the module off; on = the brightness, then the module on (sweet_wled_module).
+  */
+ bool
+ AppleCLCD::blSet(bool on)
+@@ -2973,10 +3003,12 @@ AppleCLCD::blSet(bool on)
+ 			uint16_t got = 0xffff;
+ 			ok = sweet_wled_read16(n, &got) == 0 && got == want[n];
+ 		}
++		uint8_t mod = 0xff;
++		ok = ok && sweet_wled_module(on, &mod) == 0;
+ 		if (ok) {
+ 			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
+-			IOLog("SWEET FB: backlight %s (0x%04x/0x%04x)%s\n", on ? "on" : "off", want[0], want[1],
+-			    attempt ? " after a retry" : "");
++			IOLog("SWEET FB: backlight %s (0x%04x/0x%04x, MOD_EN 0x%02x)%s\n", on ? "on" : "off", want[0], want[1],
++			    mod, attempt ? " after a retry" : "");
+ 			return true;
+ 		}
+ 		IODelay(200);
