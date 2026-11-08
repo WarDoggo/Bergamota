@@ -1,0 +1,229 @@
+From: Poco F1 iOS port
+Subject: [PATCH] reboot: power off on the Poco F1
+
+iOS's "slide to power off" (reboot(RB_HALT), haltRestart(kPEHaltCPU)) fell to the stock spin: the screen went black
+but the phone stayed on and drained the battery. sweet_reboot_poweroff() flushes the UFS cache, clears a stored reboot
+reason, asks the firmware to power off (PSCI SYSTEM_OFF, as mainline Linux does on SDM845) and, if the firmware
+returns, does what downstream msm-poweroff does: the PM8998 PS_HOLD reset type is set to shutdown (0x85a = type 4,
+0x85b reset enable off for 500 us around it, qpnp-power-on.c) and PS_HOLD goes low. Those two PON registers join the
+SPMI write whitelist. The sysctl kern.sweet_reboot_mode also takes "poweroff" (the boot-arg does not), so
+`sweetreboot poweroff` can refuse kernels without this patch. With a cable plugged in, the PMIC starts the phone again
+in ABL's charger path.
+
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 8228f52..2f690ef 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -33,6 +33,17 @@
+  * sweetreboot=bootloader; then a panic also resets into fastboot (unattended
+  * tests). The sysctl does not affect panics.
+  *
++ * Power off (patch 3115): iOS's "slide to power off" is reboot(RB_HALT), which
++ * reaches haltRestart(kPEHaltCPU). Before 3115 that fell to the stock spin and
++ * the phone stayed on with a black screen. sweet_reboot_poweroff() asks the
++ * firmware first (PSCI SYSTEM_OFF, as mainline Linux powers off SDM845); if it
++ * returns, it does what downstream msm-poweroff does: the PM8998 PS_HOLD reset
++ * type is set to shutdown (qpnp-power-on.c qpnp_pon_reset_config: reset enable
++ * off, 500 us, type 4, enable on) and PS_HOLD goes low. With a cable plugged
++ * in, the PMIC starts the phone again in ABL's charger path. The sysctl also
++ * takes "poweroff" (the next reboot powers off; sweetreboot poweroff uses it
++ * to refuse kernels without 3115); the boot-arg does not.
++ *
+  * Reset time may be non-preemptible (halt_all_cpus, panic): everything is
+  * mapped by sweet_reboot_init() and the SPMI helpers run lock-less there.
+  * All logs start with "SWEET REBOOT:".
+@@ -65,8 +76,13 @@ extern int sweet_ufs_flush_final(void);      /* bsd/dev/sweet_ufs.c: SYNCHRONIZE
+ #define SR_MAGIC_NORMAL     0u
+ #define SR_MAGIC_RECOVERY   0x1u           /* pm8998.dtsi mode-recovery */
+ #define SR_MAGIC_BOOTLOADER 0x2u           /* pm8998.dtsi mode-bootloader */
++#define SR_PON_PSHOLD_CTL   0x085au        /* PON_PS_HOLD_RST_CTL: reset type, bits 3:0 */
++#define SR_PON_PSHOLD_CTL2  0x085bu        /* PON_PS_HOLD_RST_CTL2 (gen2 PMIC): bit 7 reset enable */
++#define SR_PON_RESET_EN     0x80u
++#define SR_PON_TYPE_MASK    0x0fu
++#define SR_PON_TYPE_SHUTDOWN 0x04u         /* PON_POWER_OFF_SHUTDOWN */
+ 
+-enum { SR_NORMAL = 0, SR_BOOTLOADER = 1, SR_RECOVERY = 2, SR_BERGAMOTA = 3 };
++enum { SR_NORMAL = 0, SR_BOOTLOADER = 1, SR_RECOVERY = 2, SR_BERGAMOTA = 3, SR_POWEROFF = 4 };
+ 
+ static int sr_bootarg = SR_NORMAL;
+ static int sr_override = -1;               /* sysctl; -1 = none */
+@@ -78,7 +94,7 @@ static const char *
+ sr_name(int mode)
+ {
+ 	return mode == SR_BOOTLOADER ? "bootloader" : mode == SR_RECOVERY ? "recovery" :
+-	    mode == SR_BERGAMOTA ? "bergamota" : "normal";
++	    mode == SR_BERGAMOTA ? "bergamota" : mode == SR_POWEROFF ? "poweroff" : "normal";
+ }
+ 
+ static int
+@@ -93,6 +109,9 @@ sr_parse(const char *s)
+ 	if (!strcmp(s, "bergamota")) {
+ 		return SR_BERGAMOTA;
+ 	}
++	if (!strcmp(s, "poweroff")) {
++		return SR_POWEROFF;
++	}
+ 	if (!strcmp(s, "normal") || !strcmp(s, "")) {
+ 		return SR_NORMAL;
+ 	}
+@@ -127,7 +146,7 @@ sr_sysctl SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_reboot_mode,
+     CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sr_sysctl, "A",
+-    "Reboot mode of the next reboot: bootloader (fastboot), recovery, bergamota, normal");
++    "Reboot mode of the next reboot: bootloader (fastboot), recovery, bergamota, normal, poweroff");
+ 
+ /* PSCI SYSTEM_RESET (SMCCC 1.0): fallback when PS_HOLD does not reset. */
+ static void
+@@ -138,6 +157,16 @@ sr_psci_system_reset(void)
+ 	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
+ }
+ 
++/* PSCI SYSTEM_OFF (SMCCC 1.0). Returns only if the firmware did not power off: its return code. */
++static int64_t
++sr_psci_system_off(void)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000008ULL;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int64_t)x0;
++}
++
+ /* Thread context, after the SPMI driver can start. Idempotent. */
+ void
+ sweet_reboot_init(void)
+@@ -149,7 +178,7 @@ sweet_reboot_init(void)
+ 	}
+ 	if (PE_parse_boot_argn("sweetreboot", arg, sizeof(arg))) {
+ 		int mode = sr_parse(arg);
+-		if (mode < 0) {
++		if (mode < 0 || mode == SR_POWEROFF) {
+ 			printf("SWEET REBOOT: unknown boot-arg sweetreboot=%s (normal)\n", arg);
+ 		} else {
+ 			sr_bootarg = mode;
+@@ -196,6 +225,65 @@ sr_pon_set_reason(unsigned magic)
+ 	printf("SWEET REBOOT: PON_SOFT_RB_SPARE 0x88f 0x%02x -> 0x%02x (read back 0x%02x)\n", old, upd, back);
+ }
+ 
++/*
++ * PM8998 PS_HOLD reset type = shutdown (qpnp-power-on.c qpnp_pon_reset_config). Reset time: the PON
++ * write channel was mapped by sweet_reboot_init (PON_SOFT_RB_SPARE is in the same peripheral). 0 done.
++ */
++static int
++sr_pon_shutdown_type(void)
++{
++	uint8_t ctl = 0, ctl2 = 0, v;
++
++	if (!sr_pon_ready || sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL, &ctl) != 0 ||
++	    sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL2, &ctl2) != 0) {
++		printf("SWEET REBOOT: PS_HOLD reset control not readable\n");
++		return -1;
++	}
++	v = (uint8_t)(ctl2 & ~SR_PON_RESET_EN);
++	if (sweet_spmi_write(SR_PON_SID, SR_PON_PSHOLD_CTL2, &v, 1) != 0) {
++		printf("SWEET REBOOT: PS_HOLD reset enable 0x85b write failed\n");
++		return -1;
++	}
++	delay(500);     /* 10 sleep clock cycles + 50 %, as qpnp-power-on.c */
++	v = (uint8_t)((ctl & ~SR_PON_TYPE_MASK) | SR_PON_TYPE_SHUTDOWN);
++	int bad = sweet_spmi_write(SR_PON_SID, SR_PON_PSHOLD_CTL, &v, 1);
++	v = (uint8_t)(ctl2 | SR_PON_RESET_EN);
++	if (sweet_spmi_write(SR_PON_SID, SR_PON_PSHOLD_CTL2, &v, 1) != 0 || bad) {
++		printf("SWEET REBOOT: PS_HOLD reset type 0x85a write %s, enable 0x85b back %s\n",
++		    bad ? "failed" : "ok", bad ? "tried" : "failed");
++		return -1;
++	}
++	return 0;
++}
++
++/*
++ * Power off: haltRestart(kPEHaltCPU) (reboot(RB_HALT), iOS "slide to power off"), or a reboot with the sysctl
++ * mode poweroff. Returns only if nothing powered the phone off; the caller then keeps the stock behaviour.
++ */
++int
++sweet_reboot_poweroff(void)
++{
++	int flush = sweet_ufs_flush_final();
++	printf("SWEET REBOOT: UFS cache flush -> %d%s\n", flush, flush == EBUSY ? " (busy, skipped)" : "");
++	if (!sr_ready || sr_in_panic) {
++		return -1;
++	}
++	sweet_spmi_atomic();
++	printf("SWEET REBOOT: powering off\n");
++	/* a reason left by "sweetreboot -n fastboot" must not pick the next power-on's mode */
++	sr_pon_set_reason(SR_MAGIC_NORMAL);
++	int64_t r = sr_psci_system_off();
++	printf("SWEET REBOOT: PSCI SYSTEM_OFF returned %lld, PMIC shutdown + PS_HOLD\n", (long long)r);
++	if (sr_pon_shutdown_type() == 0) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*sr_pshold = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(2000 * 1000);
++	}
++	printf("SWEET REBOOT: power off failed, the phone stays on\n");
++	return -1;
++}
++
+ /* Called by SweetPlatformExpert::haltRestart for panic notifications. */
+ void
+ sweet_reboot_note_panic(void)
+@@ -212,6 +300,9 @@ sweet_reboot_restart(int panic_restart)
+ {
+ 	int mode;
+ 
++	if (!panic_restart && !sr_in_panic && sr_override == SR_POWEROFF) {
++		return sweet_reboot_poweroff();
++	}
+ 	/*
+ 	 * Before anything else, make sure the UFS write cache holds nothing the file system already
+ 	 * completed: the reset below can power-cycle the device. Does not wait for dirty file pages
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 51d8c78..9c0f43e 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -240,8 +240,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  *   0x57 0x67   WLED4_SINK_REG_BRIGHT(0/1), 16-bit little endian (1 or 2 bytes)
+  *   0x58 0x68   their high bytes (one byte)
+  * Nothing in the control module (0xd8: MOD_EN, OVP, boost) is writable.
+- * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte) only, the reboot reason
+- * of qcom-pon.c (written by sweet_reboot.c, read-modify-write).
++ * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte), the reboot reason
++ * of qcom-pon.c (written by sweet_reboot.c, read-modify-write), and
++ * PON_PS_HOLD_RST_CTL / _CTL2 (0x85a, 0x85b, one byte each), set to shutdown
++ * only by sweet_reboot_poweroff() (patch 3115).
+  * SID 2: PMI8998 SMB2 charger, single bytes, only after sweet_charger.c
+  * unlocked them (sweetcharger=2); offsets of qcom_smbx.c / downstream
+  * smb-reg.h on the 0x1000 base of pmi8998.dtsi:
+@@ -285,7 +287,8 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 	}
+ 	if (sid == 0) {
+ 		/* PON spare (reboot reason); RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set) */
+-		return (addr == 0x088fu && len == 1) || (addr >= 0x6140u && addr + len <= 0x6144u);
++		return ((addr == 0x088fu || addr == 0x085au || addr == 0x085bu) && len == 1) ||
++		    (addr >= 0x6140u && addr + len <= 0x6144u);
+ 	}
+ 	if (sid != 3) {
+ 		return false;
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index c6d113f..a45167f 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -11,6 +11,7 @@
+ #include <IOKit/IOLib.h>
+ 
+ extern "C" int sweet_reboot_restart(int panic_restart);
++extern "C" int sweet_reboot_poweroff(void);
+ extern "C" void sweet_reboot_note_panic(void);
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/sweet_spmi.h"
+@@ -67,6 +68,10 @@ SweetPlatformExpert::haltRestart(unsigned int type)
+ 	case kPERestartCPU:
+ 		(void)sweet_reboot_restart(0);
+ 		break;
++	case kPEHaltCPU:
++		/* power off (patch 3115); before it, the stock spin kept the phone on */
++		(void)sweet_reboot_poweroff();
++		break;
+ 	default:
+ 		break;
+ 	}
