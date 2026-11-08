@@ -1,0 +1,80 @@
+From: Poco F1 iOS port
+Subject: [PATCH] audio: the codec's power-up logs only real problems
+
+Every first codec start logged "DSP crash reason: SFR Init: wdog or kernel error suspected." and five lines of
+"SMMU bank 3 fault status 0x400", and then worked. Neither is a fault. The DSP fills its crash-reason slot with that
+text when it starts and a crash replaces it; and FSR bits 10:9 are the FORMAT field (0b10 = AArch64 tables), which
+reads 0x400 on a healthy bank and cannot be cleared.
+
+The SMMU poll now prints a line only when a fault bit is set (Linux's ARM_SMMU_FSR_FAULT), and keeps its 1 s of waits.
+The crash reason is printed after a failed step, or when it is not the DSP's start-up text.
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index b07f5c5..ae800e7 100755
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2887,15 +2887,21 @@ cx_qmi(uint16_t msg, const uint8_t *tlv, uint16_t tlen)
+ 	return 0xfffe;                          /* answered without a result TLV */
+ }
+ 
+-/* the DSP's crash reason in SMEM (item 423), if it wrote one */
++/*
++ * the DSP's crash reason in SMEM (item 423), if it wrote one. 3110: after a step that worked it is printed only when it
++ * is a real reason: at its start the DSP fills the slot with "SFR Init: wdog or kernel error suspected.", which a
++ * crash replaces, so that text on a running DSP means nothing went wrong.
++ */
+ static void
+-cx_dsp_crash(void)
++cx_dsp_crash(bool failed)
+ {
+ 	uint32_t sz = 0, it = sweet_smem_item(0xfffe, AU_CRASH_ITEM, &sz);
+ 	char msg[129];
+ 	uint32_t n;
+ 	if (!it || !sz) {
+-		CX_LOG("DSP crash reason: none in SMEM\n");
++		if (failed) {
++			CX_LOG("DSP crash reason: none in SMEM\n");
++		}
+ 		return;
+ 	}
+ 	n = MIN(sz, 128u);
+@@ -2904,6 +2910,9 @@ cx_dsp_crash(void)
+ 		memcpy(msg + k, &w, MIN(4u, n - k));
+ 	}
+ 	msg[n] = 0;
++	if (!failed && (!msg[0] || memcmp(msg, "SFR Init", 8) == 0)) {
++		return;
++	}
+ 	CX_LOG("DSP crash reason: \"%s\"\n", msg[0] ? msg : "(empty)");
+ }
+ 
+@@ -3069,19 +3078,26 @@ cx_stage_qmi(void)
+ 	CX_LOG("QMI SELECT_INSTANCE -> %d\n", r);
+ 	sweet_log_sync();
+ 	if (r) {
+-		cx_dsp_crash();
++		cx_dsp_crash(true);
+ 		return false;
+ 	}
+ 	uint8_t pwr[7] = { 0x01, 4, 0, 2, 0, 0, 0 };                              /* active */
+ 	r = cx_qmi(0x21, pwr, sizeof(pwr));
+ 	CX_LOG("QMI POWER active -> %d\n", r);
+ 	sweet_log_sync();
+-	cx_dsp_crash();
++	cx_dsp_crash(r != 0);
++	/*
++	 * 3110: FSR bits 10:9 are FORMAT (0b10 = AArch64 tables), not a fault: the bank reads 0x400 with nothing wrong, and
++	 * writing it back cannot clear it. A line only for the fault bits (MULTI, SS, UUT, ASF, TLBLKF, TLBMCF, EF, PF,
++	 * AFF, TF, as Linux's ARM_SMMU_FSR_FAULT). The 1 s of polling stays: the codec gets that time after POWER.
++	 */
+ 	for (unsigned k = 0; k < 5; k++) {
+ 		uint32_t fsr = 0;
+ 		uint64_t far = 0;
+ 		int cbk = sweet_smmu_bank_fault(&fsr, &far, true);
+-		CX_LOG("SMMU bank %d fault status %#x address %#llx (%u ms after POWER)\n", cbk, fsr, far, k * 200);
++		if (fsr & 0xc00001feu) {
++			CX_LOG("SMMU bank %d fault status %#x address %#llx (%u ms after POWER)\n", cbk, fsr, far, k * 200);
++		}
+ 		au_sleep(200);
+ 	}
+ 	cx.powered = r == 0;
