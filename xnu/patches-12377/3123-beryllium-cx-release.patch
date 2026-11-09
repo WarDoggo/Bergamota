@@ -1,0 +1,241 @@
+From: Poco F1 iOS port
+Subject: [PATCH] rpmh: release the CX proxy votes after the subsystem starts
+
+The modem start (beryllium_wlan.c) and the audio DSP start (dipper_audio.c) vote cx.lvl to its top level and never
+let go, while Linux drops its proxy votes at the subsystem's handover. Poco F1 A/B with 3122's kern.sweet_cx_vlvl
+(6 pairs of 90 s, screen off, both orders): CX at nominal 148 mA against 162 mA at the top level, every pair lower,
+and the phone worked normally for 45 min at nominal (Wi-Fi, screen on and off).
+
+Each start now holds a slot before its vote. The modem's slot is released at its handover (slave-kernel bit 2, about
+2 s after ready), the DSP's 10 s after its ready (its handover is not watched), and either at a failed start. Once no
+slot is held, the governor thread votes CX at nominal (vlvl 256), and the top level again if a start began meanwhile.
+The CX vote now waits up to 20 ms for another RPMh request instead of failing a start. Writing kern.sweet_cx_vlvl
+turns the automatic release off until the next boot; 20 failed votes do the same.
+
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index df0d772..a7f25f2 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1017,6 +1017,9 @@ wl_inventory(void)
+ #define VMBIT(v)                (1u << (v))
+ 
+ extern int sweet_rpmh_arc_vote(const char *res, bool max);
++extern void sweet_cx_hold(unsigned slot);                       /* 3123, sweet_cpufreq.c */
++extern void sweet_cx_release(unsigned slot, unsigned after_ms);
++#define MS_CX_SLOT              0u
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -1507,6 +1510,7 @@ ms_teardown(void)
+ 		/* smp2p unwind: out->valid_entries = 0 */
+ 		wl_wr(wl.smem, ms.smp2p_out + 12, SMP2P_MAX_ENTRY);
+ 	}
++	sweet_cx_release(MS_CX_SLOT, 0);        /* 3123 */
+ 	printf("SWEET MSS: teardown done\n");
+ 	sweet_log_sync();
+ }
+@@ -2134,6 +2138,9 @@ ms_mpss_poll(void)
+ 				mw.ready = true;
+ 				printf("SWEET MSS: MPSS READY\n");
+ 			}
++			if (v & 4u) {
++				sweet_cx_release(MS_CX_SLOT, 0);        /* 3123: handover: the modem holds its own votes now */
++			}
+ 			if ((v & 1u) && !mw.fatal) {
+ 				mw.fatal = true;        /* crashed: not running, whatever came before */
+ 				printf("SWEET MSS: MPSS reported a fatal error\n");
+@@ -7923,6 +7930,7 @@ wl_mss(void)
+ 	if (!ms_step(5, "RPMh ARC votes cx/mx/mss")) {
+ 		goto out;
+ 	}
++	sweet_cx_hold(MS_CX_SLOT);              /* 3123: CX at the top level until the modem's handover */
+ 	for (int i = 0; i < 3; i++) {
+ 		if (sweet_rpmh_arc_vote(ms_arc_res[i], true) != 0) {
+ 			goto out;
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 78ffdee..a24172e 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -51,6 +51,9 @@ extern void thread_set_thread_name(thread_t th, const char *name);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_log_sync(void);
+ extern int sweet_rpmh_arc_vote(const char *res, bool max);
++extern void sweet_cx_hold(unsigned slot);                       /* 3123, sweet_cpufreq.c */
++extern void sweet_cx_release(unsigned slot, unsigned after_ms);
++#define AU_CX_SLOT              1u
+ /* bsd/dev/sweet_a630_pas.c */
+ extern int sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2);
+ /* bsd/dev/beryllium_wlan.c */
+@@ -1567,8 +1570,10 @@ au_boot(void)
+ 		printf("SWEET AUDIO: QMP load_state not consumed\n");
+ 		return false;
+ 	}
+-	if (sweet_rpmh_arc_vote("cx.lvl", true) != 0) {     /* kept: the modem holds the same apps vote while Wi-Fi runs */
++	sweet_cx_hold(AU_CX_SLOT);              /* 3123: the top level until 10 s after the DSP's ready */
++	if (sweet_rpmh_arc_vote("cx.lvl", true) != 0) {
+ 		printf("SWEET AUDIO: cx vote failed\n");
++		sweet_cx_release(AU_CX_SLOT, 0);
+ 		return false;
+ 	}
+ 	if (!au_smp2p_out()) {
+@@ -1630,6 +1635,7 @@ au_boot(void)
+ 			uint32_t gl = sweet_smem_item(AU_HOST, AU_GLINK_DESC, NULL);
+ 			printf("SWEET AUDIO: DSP READY after %u ms; glink descriptor %u %s\n", t, AU_GLINK_DESC,
+ 			    gl ? "present" : "not there yet");
++			sweet_cx_release(AU_CX_SLOT, 10000);    /* 3123: its handover is not watched; 10 s is ample */
+ 			sweet_log_sync();
+ 			return true;
+ 		}
+@@ -5316,6 +5322,7 @@ au_thread(void *arg, wait_result_t w)
+ 			au_sleep(playing ? 2 : 20);
+ 		}
+ 	}
++	sweet_cx_release(AU_CX_SLOT, 0);        /* 3123: a failed start (no-op if it never held or already let go) */
+ 	sweet_log_sync();
+ 	(void)thread_terminate(current_thread());
+ }
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 4254bd0..9be276b 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -193,6 +193,7 @@ static uint32_t cf_in_ms = 300;
+ /* 3121: A75 ceiling while the display is off (kern.sweet_cpu_off_big_khz, 0 = none): background work at low clocks */
+ static int cf_off_big_khz = 825600;
+ extern int sweet_fb_display_off;
++static void cf_cx_step(uint64_t now);   /* 3123: the CX rail's apps vote follows the subsystem starts */
+ 
+ static inline uint32_t
+ cf_rd(const struct cf_domain *d, uint32_t off)
+@@ -644,6 +645,7 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		last = now;
+ 		absolutetime_to_nanoseconds(wall, &wall_ns);
+ 		cf_mem_step(now);
++		cf_cx_step(now);
+ 		for (unsigned i = 0; i < 2; i++) {
+ 			struct cf_domain *d = &cf_dom[i];
+ 			if (d->state != CF_APPLIED) {
+@@ -805,6 +807,7 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_anim_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf
+ /* 3122: test switch for the CX rail's apps vote (bsd/dev/sweet_rpmh.c): 256 = nominal, 0 = the top level again */
+ extern int sweet_rpmh_cx_level(unsigned want);
+ static int cf_cx_vlvl;
++static bool cf_cx_manual;               /* 3123: a hand-set level stops the automatic release until the next boot */
+ static int
+ sysctl_sweet_cx_vlvl SYSCTL_HANDLER_ARGS
+ {
+@@ -816,6 +819,7 @@ sysctl_sweet_cx_vlvl SYSCTL_HANDLER_ARGS
+ 	if (v < 0 || v > 416) {
+ 		return EINVAL;
+ 	}
++	__atomic_store_n(&cf_cx_manual, true, __ATOMIC_SEQ_CST);
+ 	error = sweet_rpmh_cx_level((unsigned)v);
+ 	if (!error) {
+ 		cf_cx_vlvl = v;
+@@ -823,7 +827,88 @@ sysctl_sweet_cx_vlvl SYSCTL_HANDLER_ARGS
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cx_vlvl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cx_vlvl, "I",
+-    "CX rail apps vote: lowest level at or above this vlvl (256 nominal), 0 = top (test switch)");
++    "CX rail apps vote: lowest level at or above this vlvl (256 nominal), 0 = top; a write stops the automatic release");
++
++/*
++ * 3123: CX proxy votes, released. A subsystem start calls sweet_cx_hold(slot) before its top-level cx vote and
++ * sweet_cx_release(slot, ms) when the subsystem no longer needs it: the modem at its handover, the audio DSP 10 s after
++ * its ready, either at a failed start. Linux drops its proxy votes at handover the same way. Once no slot is held the
++ * governor votes CX at nominal (nothing before the first hold, so ABL's vote stays until then). Poco F1, screen off:
++ * 148 mA at nominal against 162 mA at the top level (A/B of kern.sweet_cx_vlvl, 6 pairs).
++ */
++#define CX_RELEASED_VLVL        256u    /* RPMH_REGULATOR_LEVEL_NOM */
++#define CX_SLOTS                2u      /* 0 the modem (beryllium_wlan.c), 1 the audio DSP (dipper_audio.c) */
++static uint64_t cf_cx_until[CX_SLOTS];  /* 0 free, ~0 held, otherwise held until this mach time */
++static bool cf_cx_seen, cf_cx_low;
++
++void sweet_cx_hold(unsigned slot);
++void
++sweet_cx_hold(unsigned slot)
++{
++	if (slot < CX_SLOTS) {
++		__atomic_store_n(&cf_cx_until[slot], ~0ULL, __ATOMIC_SEQ_CST);
++		__atomic_store_n(&cf_cx_seen, true, __ATOMIC_SEQ_CST);
++	}
++}
++
++/* after_ms 0: free now. A slot that is not held stays as it is. */
++void sweet_cx_release(unsigned slot, unsigned after_ms);
++void
++sweet_cx_release(unsigned slot, unsigned after_ms)
++{
++	if (slot >= CX_SLOTS || __atomic_load_n(&cf_cx_until[slot], __ATOMIC_SEQ_CST) != ~0ULL) {
++		return;
++	}
++	uint64_t until = 0;
++	if (after_ms) {
++		nanoseconds_to_absolutetime((uint64_t)after_ms * NSEC_PER_MSEC, &until);
++		until += mach_absolute_time();
++	}
++	__atomic_store_n(&cf_cx_until[slot], until, __ATOMIC_SEQ_CST);
++}
++
++static bool
++cf_cx_free(uint64_t now)
++{
++	for (unsigned i = 0; i < CX_SLOTS; i++) {
++		uint64_t u = __atomic_load_n(&cf_cx_until[i], __ATOMIC_SEQ_CST);
++		if (u == ~0ULL || (u != 0 && now < u)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* From the governor thread every period: one vote per change; a failed vote is tried again at the next period. */
++static void
++cf_cx_step(uint64_t now)
++{
++	if (__atomic_load_n(&cf_cx_manual, __ATOMIC_SEQ_CST) || !__atomic_load_n(&cf_cx_seen, __ATOMIC_SEQ_CST)) {
++		return;
++	}
++	bool want_low = cf_cx_free(now);
++	if (want_low == cf_cx_low) {
++		return;
++	}
++	if (!want_low) {
++		cf_cx_low = false;      /* a new start voted the top level itself */
++		return;
++	}
++	if (sweet_rpmh_cx_level(CX_RELEASED_VLVL) != 0) {
++		static unsigned fails;
++		if (++fails >= 20) {
++			__atomic_store_n(&cf_cx_manual, true, __ATOMIC_SEQ_CST);
++			printf("SWEET CPUFREQ: CX release given up after %u failed votes; CX stays at the top level\n", fails);
++		}
++		return;
++	}
++	cf_cx_low = true;
++	if (!cf_cx_free(mach_absolute_time())) {
++		/* a start began while this vote ran and may have voted before it: the top level again */
++		(void)sweet_rpmh_cx_level(0);
++		cf_cx_low = false;
++	}
++}
+ SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_off_big_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_off_big_khz, 0,
+     "A75 ceiling with the display off, kHz (0 = none)");
+ 
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index c585b07..d1526a0 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -716,8 +716,12 @@ sweet_rpmh_arc_set(const char *res, bool max, unsigned want)
+ 		printf("SWEET RPMH: %s is not an allowed ARC resource\n", res);
+ 		return EINVAL;
+ 	}
+-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+-		return EBUSY;
++	/* 3123: wait up to 20 ms for another RPMh request (the governor's CX vote) instead of failing a start */
++	for (unsigned spins = 0; __atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE); spins++) {
++		if (spins >= 200) {
++			return EBUSY;
++		}
++		delay(100);
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0, aux = 0, aux_len = 0;
