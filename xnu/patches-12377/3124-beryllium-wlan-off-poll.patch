@@ -1,0 +1,53 @@
+From: Poco F1 iOS port
+Subject: [PATCH] wlan: poll less often while connected with the display off
+
+The WLAN service thread has no interrupt from the Wi-Fi chip's copy engines. While connected it polls every 5 ms
+when idle (1 ms for 200 ms after any traffic), so with the screen off one core still wakes 200 times a second. With
+the display off the connected idle poll is now kern.sweet_wlan_off_poll_ms: default 20 ms (the service's idle poll
+when not connected), 1-100, 5 = the old behaviour. Traffic still switches to the 1 ms poll at once, and en0 output
+still wakes the thread at once.
+
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index a7f25f2..b6625c4 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -7549,6 +7549,26 @@ svc_scan(void)
+  */
+ #define SVC_IDLE_MS             20u
+ #define SVC_STATUS_MS           60000u
++
++/* 3124: the connected idle poll while the display is off, ms (5 = the same as with the display on) */
++extern int sweet_fb_display_off;
++static int svc_off_poll_ms = 20;
++static int
++svc_off_poll_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = svc_off_poll_ms, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 1 || v > 100) {
++		return EINVAL;
++	}
++	svc_off_poll_ms = v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_off_poll_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, svc_off_poll_sysctl,
++    "I", "connected Wi-Fi service idle poll with the display off, ms (1-100; 5 = as with the display on)");
+ static struct {
+ 	uint64_t loops, busy_loops, last_busy_ms, next_status_ms, echo_sent_ms;
+ 	uint32_t last_msgs, last_rx, last_tx, echo_val, echo_sent, echo_ok, echo_rtt_ms, echo_skipped;
+@@ -7684,7 +7704,11 @@ ms_ipc_run(unsigned hold_s)
+ 			svc.busy_loops++;
+ 			wl_sleep(1);
+ 		} else {
+-			wl_sleep(sta.state == ST_CONNECTED ? 5 : SVC_IDLE_MS);   /* en0 output wakes the thread at once */
++			unsigned idle_ms = SVC_IDLE_MS;
++			if (sta.state == ST_CONNECTED) {
++				idle_ms = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? (unsigned)svc_off_poll_ms : 5;
++			}
++			wl_sleep(idle_ms);      /* en0 output wakes the thread at once */
+ 		}
+ 	}
+ 	printf("SWEET IPC: %u s: glink %s, IPCRTR %s, qrtr hello %s; %u packets in, %u out; rmtfs %u reads (%llu bytes), "
