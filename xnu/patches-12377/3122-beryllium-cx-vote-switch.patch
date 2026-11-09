@@ -1,0 +1,102 @@
+From: Poco F1 iOS port
+Subject: [PATCH] rpmh: test switch for the CX rail's apps vote
+
+The modem start (1106) and the audio DSP start (3040) vote cx.lvl to its top level, as Linux's proxy votes do, but
+Linux removes the proxy votes at the subsystem's handover and this kernel never does: CX stays at its top level for
+the whole boot. The Mi 8 measured cx and mx at nominal at about 20-30 mA less with the screen off. This adds only a
+live switch to measure CX alone, after both subsystems are up: kern.sweet_cx_vlvl=256 votes the lowest CX level at or
+above nominal, 0 votes the top level again. Nothing writes it at boot, so the default is unchanged.
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index e0f75e2..4254bd0 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -801,6 +801,29 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_anim_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_anim_khz, 0, "A75 floor while the GPU sees frames");
++
++/* 3122: test switch for the CX rail's apps vote (bsd/dev/sweet_rpmh.c): 256 = nominal, 0 = the top level again */
++extern int sweet_rpmh_cx_level(unsigned want);
++static int cf_cx_vlvl;
++static int
++sysctl_sweet_cx_vlvl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = cf_cx_vlvl, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 0 || v > 416) {
++		return EINVAL;
++	}
++	error = sweet_rpmh_cx_level((unsigned)v);
++	if (!error) {
++		cf_cx_vlvl = v;
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cx_vlvl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cx_vlvl, "I",
++    "CX rail apps vote: lowest level at or above this vlvl (256 nominal), 0 = top (test switch)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_off_big_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_off_big_khz, 0,
+     "A75 ceiling with the display off, kHz (0 = none)");
+ 
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 1722951..c585b07 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -677,8 +677,30 @@ out:
+ 	return error;
+ }
+ 
++static int sweet_rpmh_arc_set(const char *res, bool max, unsigned want);
++
+ int
+ sweet_rpmh_arc_vote(const char *res, bool max)
++{
++	return sweet_rpmh_arc_set(res, max, 0);
++}
++
++/*
++ * 3122: cx.lvl at the lowest level whose vlvl is at least want (want >= 128, SVS; 256 = NOM), for the live test
++ * switch kern.sweet_cx_vlvl. want 0 = the top level, as the subsystem starts vote it.
++ */
++int sweet_rpmh_cx_level(unsigned want);
++int
++sweet_rpmh_cx_level(unsigned want)
++{
++	if (want != 0 && want < 128) {
++		return EINVAL;
++	}
++	return sweet_rpmh_arc_set("cx.lvl", want == 0, want);
++}
++
++static int
++sweet_rpmh_arc_set(const char *res, bool max, unsigned want)
+ {
+ 	static const char *const allowed[] = { "cx.lvl", "mx.lvl", "mss.lvl" };
+ 	unsigned i;
+@@ -728,12 +750,22 @@ sweet_rpmh_arc_vote(const char *res, bool max)
+ 		 * an ldoa7 off vote panicked boot 0116hw). Only mss.lvl, which nothing else on the AP uses,
+ 		 * is voted back to 0.
+ 		 */
+-		if (!max && strcmp(res, "mss.lvl")) {
++		if (!max && !want && strcmp(res, "mss.lvl")) {
+ 			printf("SWEET RPMH: %s off vote refused (kept at the top level)\n", res);
+ 			error = 0;
+ 			goto out;
+ 		}
+ 		uint32_t hlvl = max ? count - 1 : 0;
++		if (!max && want) {
++			while (hlvl + 1 < count && vl[hlvl] < want) {
++				hlvl++;
++			}
++			if (vl[hlvl] < want) {
++				printf("SWEET RPMH: %s has no level at or above vlvl %u\n", res, want);
++				error = EINVAL;
++				goto out;
++			}
++		}
+ 		printf("SWEET RPMH: %s ARC %#x: %u levels, vote hlvl %u (vlvl %u)\n", res, address, count, hlvl,
+ 		    vl[hlvl]);
+ 		error = rh_cmds(&address, &hlvl, 1);
