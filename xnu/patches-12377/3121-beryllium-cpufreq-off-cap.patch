@@ -1,0 +1,65 @@
+From: Poco F1 iOS port
+Subject: [PATCH] cpufreq: A75 ceiling while the display is off
+
+With the screen off the governor still jumps the A75s to their top state (2.8 GHz) whenever one core is busy for most
+of a 25 ms window, then walks down two states per 75 ms: in 10 s locked the cluster spent about 6 s above its floor.
+Background work at the top clocks costs more energy per instruction. The Mi 8 measured an A75 cap of 825 MHz together
+with rarer log writes at about 20 mA less with the screen off. Here the cap holds only while the display is off
+(kern.sweet_fb_display_off), so the screen-on speed is untouched. kern.sweet_cpu_off_big_khz (default 825600, 0 = no
+cap) sets it live.
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 835887e..e0f75e2 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -190,6 +190,9 @@ static volatile uint64_t cf_in_until;
+ static uint32_t cf_in_events;
+ static uint32_t cf_in_khz = 1766400;    /* sweetcpuinput_khz */
+ static uint32_t cf_in_ms = 300;
++/* 3121: A75 ceiling while the display is off (kern.sweet_cpu_off_big_khz, 0 = none): background work at low clocks */
++static int cf_off_big_khz = 825600;
++extern int sweet_fb_display_off;
+ 
+ static inline uint32_t
+ cf_rd(const struct cf_domain *d, uint32_t off)
+@@ -416,6 +419,21 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 		cur = ceil_i;
+ 	}
+ 	d->in_on = in_act;
++	/* 3121: display off: the A75 ceiling is the highest state at or below cf_off_big_khz, reached at once */
++	bool off_cap = id == 1 && cf_off_big_khz > 0 && __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED);
++	if (off_cap) {
++		uint32_t o = 0;
++		while (o + 1 < d->n && o + 1 <= ceil_i && d->khz[o + 1] <= (uint32_t)cf_off_big_khz) {
++			o++;
++		}
++		if (o < ceil_i) {
++			ceil_i = o;
++		}
++		if (cur > ceil_i) {
++			cf_request(d, ceil_i);
++			cur = ceil_i;
++		}
++	}
+ 	/* A55 boost (sweetcpufreq_little_boost=1): saturated at its ceiling for 1 s -> raise it. */
+ 	if (id == 0 && cf_boost && d->boost_top > d->cap) {
+ 		if (load >= GOV_JUMP_PCT && cur >= d->eff_cap && !in_act) {
+@@ -466,6 +484,9 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 			target = f;
+ 		}
+ 	}
++	if (off_cap && target > ceil_i) {
++		target = ceil_i;
++	}
+ 	uint32_t next = cur;
+ 	if (target > cur) {
+ 		next = target;
+@@ -780,6 +801,8 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_anim_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_anim_khz, 0, "A75 floor while the GPU sees frames");
++SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_off_big_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_off_big_khz, 0,
++    "A75 ceiling with the display off, kHz (0 = none)");
+ 
+ /*
+  * 3008: the memory side of the CPU, each switchable while the system runs. Android's kernel does all three (live DT
