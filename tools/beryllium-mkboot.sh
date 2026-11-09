@@ -10,6 +10,8 @@
 #   LEVEL=5  + vibration, flashlight  (xnu 3101: the Poco F1's motor limit is 2812 mV)
 #   LEVEL=6  + audio DSP, read-only probe (sweetaudio=1, writes nothing)
 #   LEVEL=7  + audio DSP running, GLINK and APR, kernel player (sweetaudio=3). No sound until the amp scripts exist
+#               sweetaudiodelay=30: the DSP starts 30 s after the root mount (default 150 s), while the shared FAT
+#               reader is idle between Bluetooth (~5 s) and the modem bring-up for Wi-Fi (sweetwlandelay=60)
 #
 #   ROOTPART=win        the iOS root is on that GPT partition, not userdata (Android's data stays)
 #   EXTRA_ARGS="..."    more boot-args for a test boot
@@ -28,7 +30,7 @@ CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled
 [ "$LEVEL" -ge 4 ] && CMDLINE="$CMDLINE sweetbt=1 sweetbtfast=1 sweetbtibs=1"
 [ "$LEVEL" -ge 5 ] && CMDLINE="$CMDLINE sweethap=3"
 [ "$LEVEL" -eq 6 ] && CMDLINE="$CMDLINE sweetaudio=1"
-[ "$LEVEL" -ge 7 ] && CMDLINE="$CMDLINE sweetaudio=3"
+[ "$LEVEL" -ge 7 ] && CMDLINE="$CMDLINE sweetaudio=3 sweetaudiodelay=30"
 [ -n "$ROOTPART" ] && CMDLINE="$CMDLINE ufsroot=$ROOTPART"
 CMDLINE="$CMDLINE${EXTRA_ARGS:+ $EXTRA_ARGS}"
 [ "${#CMDLINE}" -le 607 ] || { echo "boot-args are ${#CMDLINE} bytes, the field holds 607" >&2; exit 1; }
