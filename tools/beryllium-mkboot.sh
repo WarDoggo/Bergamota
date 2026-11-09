@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.." || exit 1
 [ $# -ge 2 ] || { echo "usage: LEVEL=N [ROOTPART=win] $0 KERNEL OUT.img [ADT]" >&2; exit 1; }
 LEVEL=${LEVEL:-1}
 case "$LEVEL" in [1-7]) ;; *) echo "LEVEL must be 1..7" >&2; exit 1 ;; esac
-CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1 ufslogsecs=1 sweettouchdelay=0 sweetcharger=2"
+CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1 ufslogsecs=60 sweettouchdelay=0 sweetcharger=2"
 [ "$LEVEL" -ge 2 ] && CMDLINE="$CMDLINE sweetwlan=5 sweetwlandelay=60 sweet80211=3"
 [ "$LEVEL" -ge 3 ] && CMDLINE="$CMDLINE sweetgpu=8 sweetgpufreq=gov sweetgpuboost=7 sweetgpuinput=7 sweetgpuubwc=1 sweetamp_yield=1"
 [ "$LEVEL" -ge 4 ] && CMDLINE="$CMDLINE sweetbt=1 sweetbtfast=1 sweetbtibs=1"
