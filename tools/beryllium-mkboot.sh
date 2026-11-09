@@ -6,6 +6,8 @@
 #   LEVEL=1  display, touch, buttons, USB network + SSH, battery, charging   (CPU drawing)
 #   LEVEL=2  + Wi-Fi
 #   LEVEL=3  + GPU              needs the firmware in the ADT (tools/adt-gpufw.py)
+#               sweetgpuinput=7: a touch holds the GPU at its top level (710 MHz; the driver default L4 is 520 MHz,
+#               which made the first ~300 ms of a scroll stutter while the governor climbed)
 #   LEVEL=4  + Bluetooth        needs RENEGADE_BT_FW in the root
 #   LEVEL=5  + vibration, flashlight  (xnu 3101: the Poco F1's motor limit is 2812 mV)
 #   LEVEL=6  + audio DSP, read-only probe (sweetaudio=1, writes nothing)
@@ -26,7 +28,7 @@ LEVEL=${LEVEL:-1}
 case "$LEVEL" in [1-7]) ;; *) echo "LEVEL must be 1..7" >&2; exit 1 ;; esac
 CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1 ufslogsecs=1 sweettouchdelay=0 sweetcharger=2"
 [ "$LEVEL" -ge 2 ] && CMDLINE="$CMDLINE sweetwlan=5 sweetwlandelay=60 sweet80211=3"
-[ "$LEVEL" -ge 3 ] && CMDLINE="$CMDLINE sweetgpu=8 sweetgpufreq=gov sweetgpuhb=10 sweetgpuboost=7 sweetgpuubwc=1 sweetamp_yield=1"
+[ "$LEVEL" -ge 3 ] && CMDLINE="$CMDLINE sweetgpu=8 sweetgpufreq=gov sweetgpuboost=7 sweetgpuinput=7 sweetgpuubwc=1 sweetamp_yield=1"
 [ "$LEVEL" -ge 4 ] && CMDLINE="$CMDLINE sweetbt=1 sweetbtfast=1 sweetbtibs=1"
 [ "$LEVEL" -ge 5 ] && CMDLINE="$CMDLINE sweethap=3"
 [ "$LEVEL" -eq 6 ] && CMDLINE="$CMDLINE sweetaudio=1"
