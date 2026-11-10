@@ -7,7 +7,7 @@
  * the answer is always "non-apfs": fileproviderd never sets up the local storage domain and the Files app stays empty.
  *
  * FileProviderDaemon calls the function through a call stub whose pointer slot is in the dyld cache (iOS 26.6.2: stub
- * adrp x17 / add x17 / ldr x16, [x17] / br x16). At load time this library finds every stub in FileProviderDaemon whose
+ * adrp x17 / add x17 / ldr x16, [x17] / br x16). For every image loaded in fileproviderd (now and later) this library finds every stub whose
  * slot holds FPVolumeFPFSSupported (found with dlsym: no addresses) and points the slot at our function, in this process
  * only (vm_protect with VM_PROT_COPY, as the GPU hooks do). Our function calls Apple's and changes its answer to "yes"
  * only when the volume is local, read-write HFS and the only reasons are "non-apfs" / "unencrypted"; every other answer
@@ -121,26 +121,61 @@ write_slot(uintptr_t *slot, uintptr_t value)
 	return true;
 }
 
-static void
-hook(const struct mach_header_64 *mh, const char *name)
+static unsigned
+hook_section(const struct mach_header_64 *mh, const char *sect, unsigned *done)
 {
 	unsigned long size = 0;
-	const uint8_t *stubs = getsectiondata(mh, "__TEXT", "__auth_stubs", &size);
+	const uint8_t *stubs = getsectiondata(mh, "__TEXT", sect, &size);
 	uintptr_t want = (uintptr_t)ptrauth_strip((void *)gOrig, ptrauth_key_asia);
 	uintptr_t ours = (uintptr_t)ptrauth_strip((void *)&sweet_fpfs_supported, ptrauth_key_asia);
-	unsigned found = 0, done = 0;
+	unsigned found = 0;
 	for (unsigned long off = 0; stubs && off + 16 <= size; off += 4) {
 		bool sig = false;
 		uintptr_t *slot = stub_slot((const uint32_t *)(stubs + off), (uintptr_t)(stubs + off), &sig);
-		if (!slot || (uintptr_t)ptrauth_strip((void *)*slot, ptrauth_key_asia) != want) {
+		if (!slot) {
+			continue;
+		}
+		uintptr_t now = (uintptr_t)ptrauth_strip((void *)*slot, ptrauth_key_asia);
+		if (now != want && now != ours) {
 			continue;
 		}
 		found++;
-		uintptr_t v = sig ? (uintptr_t)ptrauth_sign_unauthenticated((void *)ours, ptrauth_key_asia, (uintptr_t)slot) : ours;
-		done += write_slot(slot, v);
+		if (now == want) {
+			uintptr_t v = sig ? (uintptr_t)ptrauth_sign_unauthenticated((void *)ours, ptrauth_key_asia, (uintptr_t)slot) : ours;
+			*done += write_slot(slot, v);
+		}
 		off += 12;
 	}
-	note("%s: %u stub(s) for FPVolumeFPFSSupported, %u pointed at ours", name, found, done);
+	return found;
+}
+
+/*
+ * Every image, also those loaded later (plug-in bundles such as FileProviderOverride.bundle): the check is reached from
+ * images other than FileProviderDaemon (2026-11-10 test 1: the check logged "non-apfs" without passing our stub).
+ */
+static void
+image_added(const struct mach_header *mh, intptr_t slide)
+{
+	(void)slide;
+	static unsigned seen;
+	unsigned done = 0;
+	const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+	unsigned found = hook_section(h, "__auth_stubs", &done) + hook_section(h, "__stubs", &done);
+	seen++;
+	if (found) {
+		Dl_info info;
+		const char *p = dladdr(mh, &info) && info.dli_fname ? info.dli_fname : "?";
+		const char *b = strrchr(p, '/');
+		note("%s (image %u): %u stub(s) for FPVolumeFPFSSupported, %u slot(s) pointed at ours now", b ? b + 1 : p, seen,
+		    found, done);
+	}
+}
+
+static void
+hook_all(void)
+{
+	_dyld_register_func_for_add_image(image_added);
+	note("watching %u loaded images and any loaded later", _dyld_image_count());
 }
 
 __attribute__((constructor)) static void
@@ -159,12 +194,5 @@ sweetfiles_init(void)
 		note("FPVolumeFPFSSupported not found: nothing changed");
 		return;
 	}
-	for (uint32_t i = 0, n = _dyld_image_count(); i < n; i++) {
-		const char *p = _dyld_get_image_name(i);
-		if (p && strstr(p, "/FileProviderDaemon.framework/FileProviderDaemon")) {
-			hook((const struct mach_header_64 *)_dyld_get_image_header(i), "FileProviderDaemon");
-			return;
-		}
-	}
-	note("FileProviderDaemon not loaded: nothing changed");
+	hook_all();
 }
