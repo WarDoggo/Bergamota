@@ -11,6 +11,7 @@ on:
       - tools/sweetnet/sweetuicache.m
       - tools/sweetnet/uicache.entitlements
       - tools/sweetnet/sweettorch.m
+      - tools/sweetnet/sweetfiles.m
       - tools/sweetnet/sweeti2c.c
       - tools/sweetnet/sweetplay.c
       - tools/sweetnet/sweettouch.c
@@ -50,6 +51,11 @@ jobs:
             -dynamiclib -install_name /usr/local/lib/sweettorch.dylib -framework Foundation tools/sweetnet/sweettorch.m -o out/sweettorch.dylib
           codesign -s - -f out/sweettorch.dylib
           python3 -I $P --sign out/sweettorch.dylib
+          # fileproviderd accepts the HFS+ data volume (Files app "On My iPhone"), linked into fileproviderd
+          xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=26.0 -O2 -Wall -fobjc-arc \
+            -dynamiclib -install_name /usr/local/lib/sweetfiles.dylib -framework Foundation tools/sweetnet/sweetfiles.m -o out/sweetfiles.dylib
+          codesign -s - -f out/sweetfiles.dylib
+          python3 -I $P --sign out/sweetfiles.dylib
           xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation \
             -framework CoreHaptics tools/sweetnet/sweethaptic.m -o out/sweethaptic
           codesign -s - -f --entitlements tools/sweetnet/entitlements.plist out/sweethaptic
